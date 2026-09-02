@@ -38,7 +38,7 @@
 #endif
 
 /* 编码后各部分的大小，单位均为字节。 */
-#define COMM_FRAME_HEADER_SIZE          8u
+#define COMM_FRAME_HEADER_SIZE          COMM_FRAME_PAYLOAD_OFFSET
 #define COMM_FRAME_CRC_SIZE             2u
 #define COMM_FRAME_MIN_ENCODED_SIZE     \
     (COMM_FRAME_HEADER_SIZE + COMM_FRAME_CRC_SIZE)
@@ -68,11 +68,11 @@ typedef enum {
  * 从而避免结构体填充和 CPU 字节序影响通信协议。
  */
 typedef struct {
-    uint8_t version;
-    uint8_t type;
-    uint16_t sequence;
-    uint16_t payload_length;
-    uint8_t payload[COMM_FRAME_MAX_PAYLOAD_SIZE];
+    uint8_t version;                              /* 协议版本 */
+    uint8_t type;                                 /* 消息类型 */
+    uint16_t sequence;                            /* 请求和应答的匹配序号 */
+    uint16_t payload_length;                      /* payload 中的有效字节数 */
+    uint8_t payload[COMM_FRAME_MAX_PAYLOAD_SIZE]; /* 业务数据 */
 } comm_frame_t;
 
 #endif /* COMM_FRAME_H */
