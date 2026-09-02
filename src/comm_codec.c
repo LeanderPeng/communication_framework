@@ -9,6 +9,13 @@ static void comm_write_u16_be(uint8_t *destination, uint16_t value)
     destination[1] = (uint8_t)(value & 0xFFu);
 }
 
+/* 从连续的两个大端序字节中恢复一个 16 位整数。 */
+static uint16_t comm_read_u16_be(const uint8_t *source)
+{
+    return (uint16_t)(((uint16_t)source[0] << 8) |
+                      (uint16_t)source[1]);
+}
+
 /* 当前协议版本只接受下面四种通信消息类型。 */
 static int comm_frame_type_is_valid(uint8_t type)
 {
@@ -106,5 +113,76 @@ comm_codec_result_t comm_codec_encode(const comm_frame_t *frame,
     comm_write_u16_be(&output[crc_offset], crc);
 
     *encoded_size = required_size;
+    return COMM_CODEC_OK;
+}
+
+comm_codec_result_t comm_codec_decode(const uint8_t *input,
+                                      size_t input_size,
+                                      comm_frame_t *frame)
+{
+    comm_frame_t decoded_frame;
+    uint16_t payload_length;
+    uint16_t received_crc;
+    uint16_t calculated_crc;
+    size_t expected_size;
+    size_t crc_input_size;
+    size_t crc_offset;
+
+    if ((input == NULL) || (frame == NULL)) {
+        return COMM_CODEC_NULL_ARGUMENT;
+    }
+
+    if (input_size < COMM_FRAME_MIN_ENCODED_SIZE) {
+        return COMM_CODEC_INPUT_TOO_SMALL;
+    }
+
+    if ((input[COMM_FRAME_SYNC_BYTE_0_OFFSET] != COMM_FRAME_SYNC_BYTE_0) ||
+        (input[COMM_FRAME_SYNC_BYTE_1_OFFSET] != COMM_FRAME_SYNC_BYTE_1)) {
+        return COMM_CODEC_INVALID_SYNC;
+    }
+
+    if (input[COMM_FRAME_VERSION_OFFSET] != COMM_FRAME_VERSION) {
+        return COMM_CODEC_UNSUPPORTED_VERSION;
+    }
+
+    if (!comm_frame_type_is_valid(input[COMM_FRAME_TYPE_OFFSET])) {
+        return COMM_CODEC_INVALID_TYPE;
+    }
+
+    payload_length = comm_read_u16_be(
+        &input[COMM_FRAME_PAYLOAD_LENGTH_OFFSET]);
+    if (payload_length > COMM_FRAME_MAX_PAYLOAD_SIZE) {
+        return COMM_CODEC_PAYLOAD_TOO_LARGE;
+    }
+
+    expected_size = COMM_FRAME_MIN_ENCODED_SIZE + payload_length;
+    if (input_size != expected_size) {
+        return COMM_CODEC_LENGTH_MISMATCH;
+    }
+
+    crc_input_size = (COMM_FRAME_HEADER_SIZE - COMM_FRAME_VERSION_OFFSET) +
+                     payload_length;
+    calculated_crc = comm_crc16_ccitt_false(
+        &input[COMM_FRAME_VERSION_OFFSET], crc_input_size);
+    crc_offset = COMM_FRAME_PAYLOAD_OFFSET + payload_length;
+    received_crc = comm_read_u16_be(&input[crc_offset]);
+    if (received_crc != calculated_crc) {
+        return COMM_CODEC_CRC_MISMATCH;
+    }
+
+    /* 使用临时对象，确保任何解码错误都不会产生半更新的输出帧。 */
+    memset(&decoded_frame, 0, sizeof(decoded_frame));
+    decoded_frame.version = input[COMM_FRAME_VERSION_OFFSET];
+    decoded_frame.type = input[COMM_FRAME_TYPE_OFFSET];
+    decoded_frame.sequence = comm_read_u16_be(
+        &input[COMM_FRAME_SEQUENCE_OFFSET]);
+    decoded_frame.payload_length = payload_length;
+    if (payload_length > 0u) {
+        memcpy(decoded_frame.payload,
+               &input[COMM_FRAME_PAYLOAD_OFFSET],
+               payload_length);
+    }
+
+    *frame = decoded_frame;
     return COMM_CODEC_OK;
 }
