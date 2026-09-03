@@ -73,4 +73,23 @@ comm_ringbuffer_result_t comm_ringbuffer_read(comm_ringbuffer_t *ringbuffer,
                                               uint8_t *output,
                                               size_t length);
 
+/*
+ * 从当前读位置向后偏移 offset 个字节开始复制，但不消费任何数据。
+ * offset 与 length 指定的范围必须全部位于有效数据内。
+ * length 为 0 时允许 output 为空；output 不能与 storage 重叠。
+ */
+comm_ringbuffer_result_t comm_ringbuffer_peek(
+    const comm_ringbuffer_t *ringbuffer,
+    size_t offset,
+    uint8_t *output,
+    size_t length);
+
+/*
+ * 从当前读位置移除指定数量的字节，但不复制数据。
+ * 数据不足时不改变任何状态。
+ */
+comm_ringbuffer_result_t comm_ringbuffer_discard(
+    comm_ringbuffer_t *ringbuffer,
+    size_t length);
+
 #endif /* COMM_RINGBUFFER_H */

@@ -463,6 +463,119 @@ static int test_write_read_cycle(void)
     return 0;
 }
 
+/* 验证 peek 可以按偏移查看数据，且不会改变 RingBuffer 状态。 */
+static int test_peek(void)
+{
+    static const uint8_t first_data[] = {
+        0xA0u, 0xB0u, 0xC0u, 0xD0u, 0xE0u, 0xF0u
+    };
+    static const uint8_t second_data[] = {
+        0x10u, 0x20u, 0x30u, 0x40u
+    };
+    static const uint8_t expected[] = {
+        0xF0u, 0x10u, 0x20u, 0x30u
+    };
+    static const uint8_t untouched_output[] = {
+        0xA5u, 0xA5u, 0xA5u, 0xA5u
+    };
+    comm_ringbuffer_t ringbuffer;
+    uint8_t storage[8];
+    uint8_t discarded[4];
+    uint8_t output[sizeof(expected)];
+
+    TEST_CHECK(comm_ringbuffer_init(&ringbuffer,
+                                    storage,
+                                    sizeof(storage)) == COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_ringbuffer_write(&ringbuffer,
+                                     first_data,
+                                     sizeof(first_data)) ==
+               COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_ringbuffer_read(&ringbuffer,
+                                    discarded,
+                                    sizeof(discarded)) ==
+               COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_ringbuffer_write(&ringbuffer,
+                                     second_data,
+                                     sizeof(second_data)) ==
+               COMM_RINGBUFFER_OK);
+
+    TEST_CHECK(comm_ringbuffer_peek(&ringbuffer,
+                                    1u,
+                                    output,
+                                    sizeof(output)) == COMM_RINGBUFFER_OK);
+    TEST_CHECK(memcmp(output, expected, sizeof(expected)) == 0);
+    TEST_CHECK(ringbuffer.read_index == 4u);
+    TEST_CHECK(ringbuffer.write_index == 2u);
+    TEST_CHECK(ringbuffer.used == 6u);
+
+    TEST_CHECK(comm_ringbuffer_peek(&ringbuffer,
+                                    ringbuffer.used,
+                                    NULL,
+                                    0u) == COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_ringbuffer_peek(&ringbuffer,
+                                    ringbuffer.used + 1u,
+                                    NULL,
+                                    0u) ==
+               COMM_RINGBUFFER_INSUFFICIENT_DATA);
+    TEST_CHECK(comm_ringbuffer_peek(&ringbuffer, 0u, NULL, 1u) ==
+               COMM_RINGBUFFER_NULL_ARGUMENT);
+
+    memset(output, 0xA5, sizeof(output));
+    TEST_CHECK(comm_ringbuffer_peek(&ringbuffer,
+                                    3u,
+                                    output,
+                                    sizeof(output)) ==
+               COMM_RINGBUFFER_INSUFFICIENT_DATA);
+    TEST_CHECK(memcmp(output,
+                      untouched_output,
+                      sizeof(output)) == 0);
+
+    return 0;
+}
+
+/* 验证 discard 只推进状态，不需要提供无用的输出数组。 */
+static int test_discard(void)
+{
+    static const uint8_t data[] = {
+        0x10u, 0x20u, 0x30u, 0x40u, 0x50u, 0x60u
+    };
+    comm_ringbuffer_t ringbuffer;
+    uint8_t storage[8];
+
+    TEST_CHECK(comm_ringbuffer_init(&ringbuffer,
+                                    storage,
+                                    sizeof(storage)) == COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_ringbuffer_write(&ringbuffer,
+                                     data,
+                                     sizeof(data)) == COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_ringbuffer_discard(&ringbuffer, 0u) ==
+               COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_ringbuffer_discard(&ringbuffer, 4u) ==
+               COMM_RINGBUFFER_OK);
+    TEST_CHECK(ringbuffer.read_index == 4u);
+    TEST_CHECK(ringbuffer.write_index == 6u);
+    TEST_CHECK(ringbuffer.used == 2u);
+
+    TEST_CHECK(comm_ringbuffer_discard(&ringbuffer, 3u) ==
+               COMM_RINGBUFFER_INSUFFICIENT_DATA);
+    TEST_CHECK(ringbuffer.read_index == 4u);
+    TEST_CHECK(ringbuffer.used == 2u);
+
+    TEST_CHECK(comm_ringbuffer_discard(&ringbuffer, 2u) ==
+               COMM_RINGBUFFER_OK);
+    TEST_CHECK(ringbuffer.read_index == 6u);
+    TEST_CHECK(ringbuffer.write_index == 6u);
+    TEST_CHECK(ringbuffer.used == 0u);
+
+    ringbuffer.write_index = 7u;
+    TEST_CHECK(comm_ringbuffer_discard(&ringbuffer, 0u) ==
+               COMM_RINGBUFFER_INVALID_STATE);
+    TEST_CHECK(comm_ringbuffer_discard(NULL, 0u) ==
+               COMM_RINGBUFFER_NULL_ARGUMENT);
+
+    return 0;
+}
+
 int main(void)
 {
     if (test_init_validation() != 0) {
@@ -502,6 +615,12 @@ int main(void)
         return 1;
     }
     if (test_write_read_cycle() != 0) {
+        return 1;
+    }
+    if (test_peek() != 0) {
+        return 1;
+    }
+    if (test_discard() != 0) {
         return 1;
     }
 

@@ -160,10 +160,13 @@ comm_ringbuffer_result_t comm_ringbuffer_write(
     return COMM_RINGBUFFER_OK;
 }
 
-comm_ringbuffer_result_t comm_ringbuffer_read(comm_ringbuffer_t *ringbuffer,
-                                              uint8_t *output,
-                                              size_t length)
+comm_ringbuffer_result_t comm_ringbuffer_peek(
+    const comm_ringbuffer_t *ringbuffer,
+    size_t offset,
+    uint8_t *output,
+    size_t length)
 {
+    size_t start_index;
     size_t first_part_size;
     size_t second_part_size;
 
@@ -175,6 +178,10 @@ comm_ringbuffer_result_t comm_ringbuffer_read(comm_ringbuffer_t *ringbuffer,
         return COMM_RINGBUFFER_INVALID_STATE;
     }
 
+    if (offset > ringbuffer->used) {
+        return COMM_RINGBUFFER_INSUFFICIENT_DATA;
+    }
+
     if (length == 0u) {
         return COMM_RINGBUFFER_OK;
     }
@@ -183,23 +190,50 @@ comm_ringbuffer_result_t comm_ringbuffer_read(comm_ringbuffer_t *ringbuffer,
         return COMM_RINGBUFFER_NULL_ARGUMENT;
     }
 
-    if (length > ringbuffer->used) {
+    /* 使用减法比较，避免 offset + length 产生 size_t 溢出。 */
+    if (length > (ringbuffer->used - offset)) {
         return COMM_RINGBUFFER_INSUFFICIENT_DATA;
     }
 
-    first_part_size = ringbuffer->capacity - ringbuffer->read_index;
+    start_index = comm_ringbuffer_advance_index(ringbuffer->read_index,
+                                                offset,
+                                                ringbuffer->capacity);
+    first_part_size = ringbuffer->capacity - start_index;
     if (first_part_size > length) {
         first_part_size = length;
     }
     second_part_size = length - first_part_size;
 
     memcpy(output,
-           &ringbuffer->storage[ringbuffer->read_index],
+           &ringbuffer->storage[start_index],
            first_part_size);
     if (second_part_size > 0u) {
         memcpy(&output[first_part_size],
                ringbuffer->storage,
                second_part_size);
+    }
+
+    return COMM_RINGBUFFER_OK;
+}
+
+comm_ringbuffer_result_t comm_ringbuffer_discard(
+    comm_ringbuffer_t *ringbuffer,
+    size_t length)
+{
+    if (ringbuffer == NULL) {
+        return COMM_RINGBUFFER_NULL_ARGUMENT;
+    }
+
+    if (!comm_ringbuffer_state_is_valid(ringbuffer)) {
+        return COMM_RINGBUFFER_INVALID_STATE;
+    }
+
+    if (length > ringbuffer->used) {
+        return COMM_RINGBUFFER_INSUFFICIENT_DATA;
+    }
+
+    if (length == 0u) {
+        return COMM_RINGBUFFER_OK;
     }
 
     ringbuffer->read_index = comm_ringbuffer_advance_index(
@@ -209,4 +243,18 @@ comm_ringbuffer_result_t comm_ringbuffer_read(comm_ringbuffer_t *ringbuffer,
     ringbuffer->used -= length;
 
     return COMM_RINGBUFFER_OK;
+}
+
+comm_ringbuffer_result_t comm_ringbuffer_read(comm_ringbuffer_t *ringbuffer,
+                                              uint8_t *output,
+                                              size_t length)
+{
+    comm_ringbuffer_result_t result;
+
+    result = comm_ringbuffer_peek(ringbuffer, 0u, output, length);
+    if (result != COMM_RINGBUFFER_OK) {
+        return result;
+    }
+
+    return comm_ringbuffer_discard(ringbuffer, length);
 }
