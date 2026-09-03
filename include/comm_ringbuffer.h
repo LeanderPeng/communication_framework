@@ -56,6 +56,7 @@ size_t comm_ringbuffer_free_space(const comm_ringbuffer_t *ringbuffer);
  * 写入指定数量的字节。
  * 空间不足时一个字节也不写，并返回 COMM_RINGBUFFER_INSUFFICIENT_SPACE。
  * length 为 0 时允许 data 为空，并直接返回成功。
+ * data 指向的输入区域不能与 RingBuffer 的 storage 重叠。
  */
 comm_ringbuffer_result_t comm_ringbuffer_write(
     comm_ringbuffer_t *ringbuffer,
