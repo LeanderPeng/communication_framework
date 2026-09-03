@@ -265,6 +265,204 @@ static int test_write_rejects_invalid_request(void)
     return 0;
 }
 
+/* 验证普通连续读取只移除指定数量的数据。 */
+static int test_read_contiguous(void)
+{
+    static const uint8_t data[] = {
+        0x10u, 0x20u, 0x30u, 0x40u, 0x50u
+    };
+    static const uint8_t expected[] = {0x10u, 0x20u, 0x30u};
+    comm_ringbuffer_t ringbuffer;
+    uint8_t storage[8];
+    uint8_t output[sizeof(expected)];
+
+    TEST_CHECK(comm_ringbuffer_init(&ringbuffer,
+                                    storage,
+                                    sizeof(storage)) == COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_ringbuffer_write(&ringbuffer,
+                                     data,
+                                     sizeof(data)) == COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_ringbuffer_read(&ringbuffer,
+                                    output,
+                                    sizeof(output)) == COMM_RINGBUFFER_OK);
+
+    TEST_CHECK(memcmp(output, expected, sizeof(expected)) == 0);
+    TEST_CHECK(ringbuffer.read_index == sizeof(output));
+    TEST_CHECK(ringbuffer.write_index == sizeof(data));
+    TEST_CHECK(ringbuffer.used == sizeof(data) - sizeof(output));
+    TEST_CHECK(comm_ringbuffer_size(&ringbuffer) ==
+               sizeof(data) - sizeof(output));
+
+    return 0;
+}
+
+/* 验证读取跨过数组末尾后，会从索引 0 继续读取。 */
+static int test_read_wraps(void)
+{
+    static const uint8_t expected[] = {0x10u, 0x20u, 0x30u};
+    comm_ringbuffer_t ringbuffer;
+    uint8_t storage[8];
+    uint8_t output[sizeof(expected)];
+    uint8_t last_byte = 0u;
+
+    memset(storage, 0xA5, sizeof(storage));
+    storage[6] = 0x10u;
+    storage[7] = 0x20u;
+    storage[0] = 0x30u;
+    storage[1] = 0x40u;
+
+    TEST_CHECK(comm_ringbuffer_init(&ringbuffer,
+                                    storage,
+                                    sizeof(storage)) == COMM_RINGBUFFER_OK);
+    ringbuffer.read_index = 6u;
+    ringbuffer.write_index = 2u;
+    ringbuffer.used = 4u;
+
+    TEST_CHECK(comm_ringbuffer_read(&ringbuffer,
+                                    output,
+                                    sizeof(output)) == COMM_RINGBUFFER_OK);
+    TEST_CHECK(memcmp(output, expected, sizeof(expected)) == 0);
+    TEST_CHECK(ringbuffer.read_index == 1u);
+    TEST_CHECK(ringbuffer.write_index == 2u);
+    TEST_CHECK(ringbuffer.used == 1u);
+
+    TEST_CHECK(comm_ringbuffer_read(&ringbuffer,
+                                    &last_byte,
+                                    1u) == COMM_RINGBUFFER_OK);
+    TEST_CHECK(last_byte == 0x40u);
+    TEST_CHECK(ringbuffer.read_index == 2u);
+    TEST_CHECK(ringbuffer.write_index == 2u);
+    TEST_CHECK(ringbuffer.used == 0u);
+
+    return 0;
+}
+
+/* 验证一次可以读出全部容量，并恢复 read == write 的空状态。 */
+static int test_read_empties_capacity(void)
+{
+    static const uint8_t data[] = {
+        0x00u, 0x01u, 0x02u, 0x03u,
+        0x04u, 0x05u, 0x06u, 0x07u
+    };
+    comm_ringbuffer_t ringbuffer;
+    uint8_t storage[sizeof(data)];
+    uint8_t output[sizeof(data)];
+
+    TEST_CHECK(comm_ringbuffer_init(&ringbuffer,
+                                    storage,
+                                    sizeof(storage)) == COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_ringbuffer_write(&ringbuffer,
+                                     data,
+                                     sizeof(data)) == COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_ringbuffer_read(&ringbuffer,
+                                    output,
+                                    sizeof(output)) == COMM_RINGBUFFER_OK);
+
+    TEST_CHECK(memcmp(output, data, sizeof(data)) == 0);
+    TEST_CHECK(ringbuffer.read_index == 0u);
+    TEST_CHECK(ringbuffer.write_index == 0u);
+    TEST_CHECK(ringbuffer.used == 0u);
+    TEST_CHECK(comm_ringbuffer_size(&ringbuffer) == 0u);
+    TEST_CHECK(comm_ringbuffer_free_space(&ringbuffer) == sizeof(storage));
+
+    return 0;
+}
+
+/* 验证参数、状态或数据量错误不会产生部分读取。 */
+static int test_read_rejects_invalid_request(void)
+{
+    static const uint8_t data[] = {0x10u, 0x20u, 0x30u};
+    static const uint8_t untouched_output[] = {
+        0xA5u, 0xA5u, 0xA5u, 0xA5u
+    };
+    comm_ringbuffer_t ringbuffer;
+    uint8_t storage[8];
+    uint8_t output[4];
+
+    TEST_CHECK(comm_ringbuffer_init(&ringbuffer,
+                                    storage,
+                                    sizeof(storage)) == COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_ringbuffer_write(&ringbuffer,
+                                     data,
+                                     sizeof(data)) == COMM_RINGBUFFER_OK);
+
+    TEST_CHECK(comm_ringbuffer_read(&ringbuffer, NULL, 0u) ==
+               COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_ringbuffer_read(&ringbuffer, NULL, 1u) ==
+               COMM_RINGBUFFER_NULL_ARGUMENT);
+    TEST_CHECK(ringbuffer.read_index == 0u);
+    TEST_CHECK(ringbuffer.used == sizeof(data));
+
+    memset(output, 0xA5, sizeof(output));
+    TEST_CHECK(comm_ringbuffer_read(&ringbuffer,
+                                    output,
+                                    sizeof(output)) ==
+               COMM_RINGBUFFER_INSUFFICIENT_DATA);
+    TEST_CHECK(memcmp(output,
+                      untouched_output,
+                      sizeof(output)) == 0);
+    TEST_CHECK(ringbuffer.read_index == 0u);
+    TEST_CHECK(ringbuffer.write_index == sizeof(data));
+    TEST_CHECK(ringbuffer.used == sizeof(data));
+
+    ringbuffer.write_index = 4u;
+    TEST_CHECK(comm_ringbuffer_read(&ringbuffer, output, 1u) ==
+               COMM_RINGBUFFER_INVALID_STATE);
+    TEST_CHECK(output[0] == 0xA5u);
+
+    TEST_CHECK(comm_ringbuffer_read(NULL, output, sizeof(output)) ==
+               COMM_RINGBUFFER_NULL_ARGUMENT);
+
+    return 0;
+}
+
+/* 验证多次写读交错后，逻辑数据顺序仍保持不变。 */
+static int test_write_read_cycle(void)
+{
+    static const uint8_t first_data[] = {
+        0xA0u, 0xB0u, 0xC0u, 0xD0u, 0xE0u, 0xF0u
+    };
+    static const uint8_t second_data[] = {
+        0x10u, 0x20u, 0x30u, 0x40u
+    };
+    static const uint8_t expected_remaining[] = {
+        0xE0u, 0xF0u, 0x10u, 0x20u, 0x30u, 0x40u
+    };
+    comm_ringbuffer_t ringbuffer;
+    uint8_t storage[8];
+    uint8_t discarded[4];
+    uint8_t remaining[sizeof(expected_remaining)];
+
+    TEST_CHECK(comm_ringbuffer_init(&ringbuffer,
+                                    storage,
+                                    sizeof(storage)) == COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_ringbuffer_write(&ringbuffer,
+                                     first_data,
+                                     sizeof(first_data)) ==
+               COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_ringbuffer_read(&ringbuffer,
+                                    discarded,
+                                    sizeof(discarded)) ==
+               COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_ringbuffer_write(&ringbuffer,
+                                     second_data,
+                                     sizeof(second_data)) ==
+               COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_ringbuffer_read(&ringbuffer,
+                                    remaining,
+                                    sizeof(remaining)) ==
+               COMM_RINGBUFFER_OK);
+
+    TEST_CHECK(memcmp(remaining,
+                      expected_remaining,
+                      sizeof(remaining)) == 0);
+    TEST_CHECK(ringbuffer.read_index == 2u);
+    TEST_CHECK(ringbuffer.write_index == 2u);
+    TEST_CHECK(ringbuffer.used == 0u);
+
+    return 0;
+}
+
 int main(void)
 {
     if (test_init_validation() != 0) {
@@ -289,6 +487,21 @@ int main(void)
         return 1;
     }
     if (test_write_rejects_invalid_request() != 0) {
+        return 1;
+    }
+    if (test_read_contiguous() != 0) {
+        return 1;
+    }
+    if (test_read_wraps() != 0) {
+        return 1;
+    }
+    if (test_read_empties_capacity() != 0) {
+        return 1;
+    }
+    if (test_read_rejects_invalid_request() != 0) {
+        return 1;
+    }
+    if (test_write_read_cycle() != 0) {
         return 1;
     }
 

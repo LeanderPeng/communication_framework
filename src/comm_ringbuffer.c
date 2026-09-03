@@ -159,3 +159,54 @@ comm_ringbuffer_result_t comm_ringbuffer_write(
 
     return COMM_RINGBUFFER_OK;
 }
+
+comm_ringbuffer_result_t comm_ringbuffer_read(comm_ringbuffer_t *ringbuffer,
+                                              uint8_t *output,
+                                              size_t length)
+{
+    size_t first_part_size;
+    size_t second_part_size;
+
+    if (ringbuffer == NULL) {
+        return COMM_RINGBUFFER_NULL_ARGUMENT;
+    }
+
+    if (!comm_ringbuffer_state_is_valid(ringbuffer)) {
+        return COMM_RINGBUFFER_INVALID_STATE;
+    }
+
+    if (length == 0u) {
+        return COMM_RINGBUFFER_OK;
+    }
+
+    if (output == NULL) {
+        return COMM_RINGBUFFER_NULL_ARGUMENT;
+    }
+
+    if (length > ringbuffer->used) {
+        return COMM_RINGBUFFER_INSUFFICIENT_DATA;
+    }
+
+    first_part_size = ringbuffer->capacity - ringbuffer->read_index;
+    if (first_part_size > length) {
+        first_part_size = length;
+    }
+    second_part_size = length - first_part_size;
+
+    memcpy(output,
+           &ringbuffer->storage[ringbuffer->read_index],
+           first_part_size);
+    if (second_part_size > 0u) {
+        memcpy(&output[first_part_size],
+               ringbuffer->storage,
+               second_part_size);
+    }
+
+    ringbuffer->read_index = comm_ringbuffer_advance_index(
+        ringbuffer->read_index,
+        length,
+        ringbuffer->capacity);
+    ringbuffer->used -= length;
+
+    return COMM_RINGBUFFER_OK;
+}

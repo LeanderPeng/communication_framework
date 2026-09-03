@@ -67,6 +67,7 @@ comm_ringbuffer_result_t comm_ringbuffer_write(
  * 读取并移除指定数量的字节。
  * 数据不足时一个字节也不读，并返回 COMM_RINGBUFFER_INSUFFICIENT_DATA。
  * length 为 0 时允许 output 为空，并直接返回成功。
+ * output 指向的输出区域不能与 RingBuffer 的 storage 重叠。
  */
 comm_ringbuffer_result_t comm_ringbuffer_read(comm_ringbuffer_t *ringbuffer,
                                               uint8_t *output,
