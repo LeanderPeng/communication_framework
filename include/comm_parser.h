@@ -13,6 +13,7 @@ typedef enum {
     COMM_PARSER_NEED_MORE_DATA,
     COMM_PARSER_NULL_ARGUMENT,
     COMM_PARSER_SCRATCH_TOO_SMALL,
+    COMM_PARSER_RINGBUFFER_TOO_SMALL,
     COMM_PARSER_RINGBUFFER_ERROR
 } comm_parser_result_t;
 
@@ -23,6 +24,9 @@ typedef enum {
  * scratch         调用方提供的连续临时缓冲区。
  * scratch_capacity 临时缓冲区容量，至少为 COMM_FRAME_MAX_ENCODED_SIZE。
  * frame           成功时接收解码后的逻辑帧。
+ *
+ * ringbuffer 的容量也必须至少为 COMM_FRAME_MAX_ENCODED_SIZE，确保最大
+ * 合法帧能够完整保留到校验结束。
  *
  * 返回 COMM_PARSER_FRAME_READY 时，恰好消费一帧并更新 frame。
  * 返回 COMM_PARSER_NEED_MORE_DATA 时，不完整的候选帧仍保留在 RingBuffer；
