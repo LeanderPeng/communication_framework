@@ -107,6 +107,61 @@ static int test_destroy_validation(void)
     return 0;
 }
 
+/* 验证 close 可重复调用，并且不会丢弃关闭前已入队的帧。 */
+static int test_close_is_idempotent_and_preserves_frames(void)
+{
+    comm_frame_queue_pthread_t queue;
+    comm_frame_t storage[2];
+    comm_frame_t input;
+
+    memset(&input, 0, sizeof(input));
+    input.version = COMM_FRAME_VERSION;
+    input.type = COMM_FRAME_TYPE_REPORT;
+    input.sequence = 0x1234u;
+    input.payload_length = 1u;
+    input.payload[0] = 0x5Au;
+
+    TEST_CHECK(comm_frame_queue_pthread_init(&queue, storage, 2u) ==
+               COMM_FRAME_QUEUE_PTHREAD_OK);
+
+    /* 并发接口尚未实现，测试内部直接预置一帧以验证 close 不清空 core。 */
+    TEST_CHECK(comm_frame_queue_push(&queue.core, &input) ==
+               COMM_FRAME_QUEUE_OK);
+
+    TEST_CHECK(comm_frame_queue_pthread_close(&queue) ==
+               COMM_FRAME_QUEUE_PTHREAD_OK);
+    TEST_CHECK(queue.closed == 1);
+    TEST_CHECK(queue.core.used == 1u);
+    TEST_CHECK(queue.core.read_index == 0u);
+    TEST_CHECK(queue.core.write_index == 1u);
+    TEST_CHECK(storage[0].sequence == input.sequence);
+
+    TEST_CHECK(comm_frame_queue_pthread_close(&queue) ==
+               COMM_FRAME_QUEUE_PTHREAD_OK);
+    TEST_CHECK(queue.closed == 1);
+    TEST_CHECK(queue.core.used == 1u);
+
+    TEST_CHECK(comm_frame_queue_pthread_destroy(&queue) ==
+               COMM_FRAME_QUEUE_PTHREAD_OK);
+
+    return 0;
+}
+
+/* 验证 close 会拒绝空指针和明确的未初始化对象。 */
+static int test_close_validation(void)
+{
+    comm_frame_queue_pthread_t queue;
+
+    memset(&queue, 0, sizeof(queue));
+
+    TEST_CHECK(comm_frame_queue_pthread_close(NULL) ==
+               COMM_FRAME_QUEUE_PTHREAD_NULL_ARGUMENT);
+    TEST_CHECK(comm_frame_queue_pthread_close(&queue) ==
+               COMM_FRAME_QUEUE_PTHREAD_INVALID_STATE);
+
+    return 0;
+}
+
 int main(void)
 {
     if (test_init_validation() != 0) {
@@ -119,6 +174,12 @@ int main(void)
         return 1;
     }
     if (test_destroy_validation() != 0) {
+        return 1;
+    }
+    if (test_close_is_idempotent_and_preserves_frames() != 0) {
+        return 1;
+    }
+    if (test_close_validation() != 0) {
         return 1;
     }
 

@@ -88,6 +88,62 @@ comm_frame_queue_pthread_result_t comm_frame_queue_pthread_init(
     return COMM_FRAME_QUEUE_PTHREAD_OK;
 }
 
+comm_frame_queue_pthread_result_t comm_frame_queue_pthread_close(
+    comm_frame_queue_pthread_t *queue)
+{
+    int not_empty_result;
+    int not_full_result;
+    int unlock_result;
+
+    if (queue == NULL) {
+        return COMM_FRAME_QUEUE_PTHREAD_NULL_ARGUMENT;
+    }
+
+    /*
+     * initialized 不由 mutex 保护，因为 destroy 的调用前提本来就是：
+     * 调用方已经停止并回收所有使用该队列的线程。也就是说 close 与
+     * destroy 不能并发执行，生命周期由更外层代码负责协调。
+     */
+    if (queue->initialized != 1) {
+        return COMM_FRAME_QUEUE_PTHREAD_INVALID_STATE;
+    }
+
+    if (pthread_mutex_lock(&queue->mutex) != 0) {
+        return COMM_FRAME_QUEUE_PTHREAD_SYSTEM_ERROR;
+    }
+
+    /*
+     * 条件变量本身不保存“关闭事件”，真正持久的状态是 closed。
+     * push/pop 将在同一把 mutex 下检查 closed 和队列满/空条件，并使用
+     * while 循环等待。因此这里必须先在锁内写入 closed，再执行广播，
+     * 避免线程在“检查条件”和“进入等待”之间漏掉关闭通知。
+     */
+    queue->closed = 1;
+
+    /*
+     * close 需要唤醒所有等待者，所以使用 broadcast 而不是 signal：
+     * not_empty 上可能睡着多个消费者，not_full 上也可能睡着多个生产者。
+     * 被唤醒的线程不会立刻并行访问队列，它们必须等这里释放 mutex 后，
+     * 逐个重新获得锁并检查 closed。
+     *
+     * 即使重复 close，也再次广播。这样 close 保持幂等，同时第一次广播
+     * 若遇到罕见系统错误，调用方仍可以再次 close 尝试唤醒等待线程。
+     */
+    not_empty_result = pthread_cond_broadcast(&queue->not_empty);
+    not_full_result = pthread_cond_broadcast(&queue->not_full);
+
+    /* 广播失败也必须释放锁，否则其他线程会永久阻塞在 mutex 上。 */
+    unlock_result = pthread_mutex_unlock(&queue->mutex);
+
+    if ((not_empty_result != 0) ||
+        (not_full_result != 0) ||
+        (unlock_result != 0)) {
+        return COMM_FRAME_QUEUE_PTHREAD_SYSTEM_ERROR;
+    }
+
+    return COMM_FRAME_QUEUE_PTHREAD_OK;
+}
+
 comm_frame_queue_pthread_result_t comm_frame_queue_pthread_destroy(
     comm_frame_queue_pthread_t *queue)
 {
