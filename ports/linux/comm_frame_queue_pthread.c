@@ -228,6 +228,9 @@ comm_frame_queue_pthread_result_t comm_frame_queue_pthread_push(
     }
 
     /*
+     * timeout_ms == 0u 表示立即尝试入队，timeout_ms == WAIT_FOREVER 表示永久等待，
+     * 其他值表示有限等待。
+     *
      * 有限等待的截止时间在加锁前计算，使 mutex 上消耗的时间也尽量计入
      * 调用总时长。pthread_mutex_lock 本身没有单调时钟超时接口，因此在
      * 极端调度情况下，实际返回时间仍可能略晚于 deadline。
@@ -319,6 +322,125 @@ comm_frame_queue_pthread_result_t comm_frame_queue_pthread_push(
      * 解锁，随后才能观察到完整写入的帧。
      */
     signal_result = pthread_cond_signal(&queue->not_empty);
+    if (signal_result != 0) {
+        return comm_frame_queue_pthread_unlock_and_return(
+            queue,
+            COMM_FRAME_QUEUE_PTHREAD_SYSTEM_ERROR);
+    }
+
+    return comm_frame_queue_pthread_unlock_and_return(
+        queue,
+        COMM_FRAME_QUEUE_PTHREAD_OK);
+}
+
+comm_frame_queue_pthread_result_t comm_frame_queue_pthread_pop(
+    comm_frame_queue_pthread_t *queue,
+    comm_frame_t *frame,
+    uint32_t timeout_ms)
+{
+    struct timespec deadline;
+    int wait_result;
+    int signal_result;
+    comm_frame_queue_result_t core_result;
+
+    if ((queue == NULL) || (frame == NULL)) {
+        return COMM_FRAME_QUEUE_PTHREAD_NULL_ARGUMENT;
+    }
+
+    if (queue->initialized != 1) {
+        return COMM_FRAME_QUEUE_PTHREAD_INVALID_STATE;
+    }
+
+    /*
+     * 和 push 一样，有限等待只计算一次绝对截止时间。这样消费者即使被
+     * 虚假唤醒多次，所有 timedwait 仍共同受同一个总截止时间约束。
+     */
+    if ((timeout_ms != 0u) &&
+        (timeout_ms != COMM_FRAME_QUEUE_PTHREAD_WAIT_FOREVER) &&
+        !comm_frame_queue_pthread_make_deadline(timeout_ms, &deadline)) {
+        return COMM_FRAME_QUEUE_PTHREAD_SYSTEM_ERROR;
+    }
+
+    if (pthread_mutex_lock(&queue->mutex) != 0) {
+        return COMM_FRAME_QUEUE_PTHREAD_SYSTEM_ERROR;
+    }
+
+    if (!comm_frame_queue_pthread_core_is_valid(queue)) {
+        return comm_frame_queue_pthread_unlock_and_return(
+            queue,
+            COMM_FRAME_QUEUE_PTHREAD_INVALID_STATE);
+    }
+
+    /*
+     * 消费者只在“队列为空且尚未关闭”时等待。这里同样必须使用 while：
+     * 条件变量可能虚假唤醒；多个消费者也可能同时被唤醒并竞争同一帧，
+     * 后获得 mutex 的消费者必须重新确认队列中是否仍有数据。
+     */
+    while ((queue->closed == 0) && (queue->core.used == 0u)) {
+        if (timeout_ms == 0u) {
+            return comm_frame_queue_pthread_unlock_and_return(
+                queue,
+                COMM_FRAME_QUEUE_PTHREAD_TIMEOUT);
+        }
+
+        if (timeout_ms == COMM_FRAME_QUEUE_PTHREAD_WAIT_FOREVER) {
+            wait_result = pthread_cond_wait(&queue->not_empty,
+                                            &queue->mutex);
+        } else {
+            wait_result = pthread_cond_timedwait(&queue->not_empty,
+                                                 &queue->mutex,
+                                                 &deadline);
+        }
+
+        /* timedwait 返回时已经重新获得 mutex，可以安全检查关闭状态。 */
+        if (wait_result == ETIMEDOUT) {
+            if ((queue->closed != 0) && (queue->core.used == 0u)) {
+                return comm_frame_queue_pthread_unlock_and_return(
+                    queue,
+                    COMM_FRAME_QUEUE_PTHREAD_CLOSED);
+            }
+
+            return comm_frame_queue_pthread_unlock_and_return(
+                queue,
+                COMM_FRAME_QUEUE_PTHREAD_TIMEOUT);
+        }
+
+        if (wait_result != 0) {
+            return comm_frame_queue_pthread_unlock_and_return(
+                queue,
+                COMM_FRAME_QUEUE_PTHREAD_SYSTEM_ERROR);
+        }
+
+        if (!comm_frame_queue_pthread_core_is_valid(queue)) {
+            return comm_frame_queue_pthread_unlock_and_return(
+                queue,
+                COMM_FRAME_QUEUE_PTHREAD_INVALID_STATE);
+        }
+    }
+
+    /*
+     * close 只禁止继续生产，不丢弃已经入队的帧。因此只有“已关闭并且已空”
+     * 才返回 CLOSED；如果 closed != 0 但 used > 0，仍继续执行本次 pop。
+     */
+    if ((queue->closed != 0) && (queue->core.used == 0u)) {
+        return comm_frame_queue_pthread_unlock_and_return(
+            queue,
+            COMM_FRAME_QUEUE_PTHREAD_CLOSED);
+    }
+
+    core_result = comm_frame_queue_pop(&queue->core, frame);
+    if (core_result != COMM_FRAME_QUEUE_OK) {
+        return comm_frame_queue_pthread_unlock_and_return(
+            queue,
+            COMM_FRAME_QUEUE_PTHREAD_INVALID_STATE);
+    }
+
+    /*
+     * 一次出队只释放一个槽位，正常情况下只需 signal 一个等待入队的生产者。
+     * core 的状态修改和 signal 都在 mutex 内完成；生产者重新获得 mutex 后
+     * 才能看到已经释放的槽位。
+     */
+    signal_result = pthread_cond_signal(&queue->not_full);
     if (signal_result != 0) {
         return comm_frame_queue_pthread_unlock_and_return(
             queue,
