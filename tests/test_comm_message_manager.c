@@ -422,6 +422,272 @@ static int test_send_validation_and_channel_mapping(void)
     return 0;
 }
 
+/* 验证请求发送成功后才登记 pending、截止时间和输出序号。 */
+static int test_send_request_success(void)
+{
+    static const uint8_t payload[] = {0x10u, 0x20u, 0x30u};
+    comm_message_manager_t manager;
+    comm_frame_channel_t channel;
+    comm_message_pending_t pending[2];
+    comm_message_manager_config_t config;
+    fake_channel_backend_t backend;
+    uint16_t sequence = 0xA5A5u;
+
+    memset(&backend, 0, sizeof(backend));
+    config.response_timeout_ms = 100u;
+    config.send_timeout_ms = 25u;
+    config.max_retries = 2u;
+    TEST_CHECK(make_bound_channel(&channel, &backend));
+    TEST_CHECK(comm_message_manager_init(&manager,
+                                         &channel,
+                                         pending,
+                                         2u,
+                                         &config,
+                                         fake_event_callback,
+                                         NULL) ==
+               COMM_MESSAGE_MANAGER_OK);
+
+    TEST_CHECK(comm_message_manager_send_request(&manager,
+                                                 payload,
+                                                 sizeof(payload),
+                                                 1000u,
+                                                 &sequence) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(sequence == 1u);
+    TEST_CHECK(manager.next_sequence == 2u);
+    TEST_CHECK(backend.push_count == 1u);
+    TEST_CHECK(backend.timeout_ms == config.send_timeout_ms);
+    TEST_CHECK(backend.pushed_frame.version == COMM_FRAME_VERSION);
+    TEST_CHECK(backend.pushed_frame.type == COMM_FRAME_TYPE_REQUEST);
+    TEST_CHECK(backend.pushed_frame.sequence == 1u);
+    TEST_CHECK(backend.pushed_frame.payload_length == sizeof(payload));
+    TEST_CHECK(memcmp(backend.pushed_frame.payload,
+                      payload,
+                      sizeof(payload)) == 0);
+    TEST_CHECK(backend.pushed_frame.payload[sizeof(payload)] == 0u);
+
+    TEST_CHECK(pending[0].active == 1);
+    TEST_CHECK(pending[0].request.type == COMM_FRAME_TYPE_REQUEST);
+    TEST_CHECK(pending[0].request.sequence == 1u);
+    TEST_CHECK(pending[0].deadline_ms == 1100u);
+    TEST_CHECK(pending[0].retries_done == 0u);
+    TEST_CHECK(pending[1].active == 0);
+
+    return 0;
+}
+
+/* 验证 sequence 会跳过活动请求，并在 UINT16_MAX 后绕回 1。 */
+static int test_send_request_sequence_allocation(void)
+{
+    comm_message_manager_t manager;
+    comm_frame_channel_t channel;
+    comm_message_pending_t pending[4];
+    comm_message_manager_config_t config;
+    fake_channel_backend_t backend;
+    uint16_t sequence;
+
+    memset(&backend, 0, sizeof(backend));
+    config.response_timeout_ms = 100u;
+    config.send_timeout_ms = 0u;
+    config.max_retries = 1u;
+    TEST_CHECK(make_bound_channel(&channel, &backend));
+    TEST_CHECK(comm_message_manager_init(&manager,
+                                         &channel,
+                                         pending,
+                                         4u,
+                                         &config,
+                                         fake_event_callback,
+                                         NULL) ==
+               COMM_MESSAGE_MANAGER_OK);
+
+    memset(&pending[0], 0, sizeof(pending[0]));
+    pending[0].request.version = COMM_FRAME_VERSION;
+    pending[0].request.type = COMM_FRAME_TYPE_REQUEST;
+    pending[0].request.sequence = 1u;
+    pending[0].active = 1;
+    manager.next_sequence = 1u;
+
+    TEST_CHECK(comm_message_manager_send_request(&manager,
+                                                 NULL,
+                                                 0u,
+                                                 1000u,
+                                                 &sequence) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(sequence == 2u);
+    TEST_CHECK(pending[1].request.sequence == 2u);
+
+    manager.next_sequence = UINT16_MAX;
+    TEST_CHECK(comm_message_manager_send_request(&manager,
+                                                 NULL,
+                                                 0u,
+                                                 1100u,
+                                                 &sequence) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(sequence == UINT16_MAX);
+    TEST_CHECK(manager.next_sequence == 1u);
+
+    TEST_CHECK(comm_message_manager_send_request(&manager,
+                                                 NULL,
+                                                 0u,
+                                                 1200u,
+                                                 &sequence) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(sequence == 3u);
+    TEST_CHECK(manager.next_sequence == 4u);
+
+    sequence = 0xA5A5u;
+    TEST_CHECK(comm_message_manager_send_request(&manager,
+                                                 NULL,
+                                                 0u,
+                                                 1300u,
+                                                 &sequence) ==
+               COMM_MESSAGE_MANAGER_PENDING_FULL);
+    TEST_CHECK(sequence == 0xA5A5u);
+    TEST_CHECK(backend.push_count == 3u);
+
+    return 0;
+}
+
+/* 验证发送失败不会提交 pending、推进 sequence 或修改输出值。 */
+static int test_send_request_failure_is_transactional(void)
+{
+    comm_message_manager_t manager;
+    comm_frame_channel_t channel;
+    comm_message_pending_t pending[1];
+    comm_message_manager_config_t config;
+    fake_channel_backend_t backend;
+    uint16_t sequence = 0xA5A5u;
+    uint8_t payload = 0x5Au;
+
+    memset(&backend, 0, sizeof(backend));
+    config.response_timeout_ms = 100u;
+    config.send_timeout_ms = 10u;
+    config.max_retries = 1u;
+    TEST_CHECK(make_bound_channel(&channel, &backend));
+    TEST_CHECK(comm_message_manager_init(&manager,
+                                         &channel,
+                                         pending,
+                                         1u,
+                                         &config,
+                                         fake_event_callback,
+                                         NULL) ==
+               COMM_MESSAGE_MANAGER_OK);
+
+    backend.push_result = COMM_FRAME_CHANNEL_TIMEOUT;
+    TEST_CHECK(comm_message_manager_send_request(&manager,
+                                                 &payload,
+                                                 1u,
+                                                 1000u,
+                                                 &sequence) ==
+               COMM_MESSAGE_MANAGER_CHANNEL_TIMEOUT);
+    TEST_CHECK(pending[0].active == 0);
+    TEST_CHECK(manager.next_sequence == 1u);
+    TEST_CHECK(sequence == 0xA5A5u);
+
+    backend.push_result = COMM_FRAME_CHANNEL_CLOSED;
+    TEST_CHECK(comm_message_manager_send_request(&manager,
+                                                 &payload,
+                                                 1u,
+                                                 1000u,
+                                                 &sequence) ==
+               COMM_MESSAGE_MANAGER_CHANNEL_CLOSED);
+    TEST_CHECK(pending[0].active == 0);
+    TEST_CHECK(manager.next_sequence == 1u);
+    TEST_CHECK(sequence == 0xA5A5u);
+
+    backend.push_result = COMM_FRAME_CHANNEL_OK;
+    TEST_CHECK(comm_message_manager_send_request(&manager,
+                                                 &payload,
+                                                 1u,
+                                                 UINT64_MAX - 50u,
+                                                 &sequence) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(pending[0].deadline_ms == UINT64_MAX);
+
+    return 0;
+}
+
+/* 验证请求参数和损坏的 pending 状态会在发送前被拒绝。 */
+static int test_send_request_validation(void)
+{
+    comm_message_manager_t manager;
+    comm_message_manager_t uninitialized_manager;
+    comm_frame_channel_t channel;
+    comm_message_pending_t pending[2];
+    comm_message_manager_config_t config;
+    fake_channel_backend_t backend;
+    uint16_t sequence = 0xA5A5u;
+    uint8_t payload = 0x5Au;
+
+    memset(&uninitialized_manager, 0, sizeof(uninitialized_manager));
+    memset(&backend, 0, sizeof(backend));
+    config.response_timeout_ms = 100u;
+    config.send_timeout_ms = 10u;
+    config.max_retries = 1u;
+    TEST_CHECK(make_bound_channel(&channel, &backend));
+    TEST_CHECK(comm_message_manager_init(&manager,
+                                         &channel,
+                                         pending,
+                                         2u,
+                                         &config,
+                                         fake_event_callback,
+                                         NULL) ==
+               COMM_MESSAGE_MANAGER_OK);
+
+    TEST_CHECK(comm_message_manager_send_request(NULL,
+                                                 &payload,
+                                                 1u,
+                                                 0u,
+                                                 &sequence) ==
+               COMM_MESSAGE_MANAGER_NULL_ARGUMENT);
+    TEST_CHECK(comm_message_manager_send_request(&manager,
+                                                 NULL,
+                                                 1u,
+                                                 0u,
+                                                 &sequence) ==
+               COMM_MESSAGE_MANAGER_NULL_ARGUMENT);
+    TEST_CHECK(comm_message_manager_send_request(&manager,
+                                                 &payload,
+                                                 1u,
+                                                 0u,
+                                                 NULL) ==
+               COMM_MESSAGE_MANAGER_NULL_ARGUMENT);
+    TEST_CHECK(comm_message_manager_send_request(
+                   &manager,
+                   &payload,
+                   COMM_FRAME_MAX_PAYLOAD_SIZE + 1u,
+                   0u,
+                   &sequence) == COMM_MESSAGE_MANAGER_PAYLOAD_TOO_LARGE);
+    TEST_CHECK(comm_message_manager_send_request(&uninitialized_manager,
+                                                 &payload,
+                                                 1u,
+                                                 0u,
+                                                 &sequence) ==
+               COMM_MESSAGE_MANAGER_INVALID_STATE);
+
+    manager.next_sequence = 0u;
+    TEST_CHECK(comm_message_manager_send_request(&manager,
+                                                 &payload,
+                                                 1u,
+                                                 0u,
+                                                 &sequence) ==
+               COMM_MESSAGE_MANAGER_INVALID_STATE);
+    TEST_CHECK(comm_message_manager_reset(&manager) ==
+               COMM_MESSAGE_MANAGER_OK);
+
+    pending[0].active = 123;
+    TEST_CHECK(comm_message_manager_send_request(&manager,
+                                                 &payload,
+                                                 1u,
+                                                 0u,
+                                                 &sequence) ==
+               COMM_MESSAGE_MANAGER_INVALID_STATE);
+    TEST_CHECK(backend.push_count == 0u);
+    TEST_CHECK(sequence == 0xA5A5u);
+
+    return 0;
+}
+
 int main(void)
 {
     if (test_init_validation() != 0) {
@@ -437,6 +703,18 @@ int main(void)
         return 1;
     }
     if (test_send_validation_and_channel_mapping() != 0) {
+        return 1;
+    }
+    if (test_send_request_success() != 0) {
+        return 1;
+    }
+    if (test_send_request_sequence_allocation() != 0) {
+        return 1;
+    }
+    if (test_send_request_failure_is_transactional() != 0) {
+        return 1;
+    }
+    if (test_send_request_validation() != 0) {
         return 1;
     }
 

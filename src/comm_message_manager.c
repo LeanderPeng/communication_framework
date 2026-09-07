@@ -52,6 +52,113 @@ static void comm_message_manager_clear_pending(
     }
 }
 
+/* 返回非零请求序号的下一个值，并在 UINT16_MAX 后绕回 1。 */
+static uint16_t comm_message_manager_next_sequence(uint16_t sequence)
+{
+    if (sequence == UINT16_MAX) {
+        return 1u;
+    }
+
+    return (uint16_t)(sequence + 1u);
+}
+
+/* 查找某个请求序号是否已经被活动 pending 占用。 */
+static int comm_message_manager_sequence_is_active(
+    const comm_message_manager_t *manager,
+    uint16_t sequence)
+{
+    size_t index;
+
+    for (index = 0u; index < manager->pending_capacity; ++index) {
+        if ((manager->pending_storage[index].active == 1) &&
+            (manager->pending_storage[index].request.sequence == sequence)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/* 返回第一个空闲 pending 槽位；全部占用时返回 NULL。 */
+static comm_message_pending_t *comm_message_manager_find_free_pending(
+    comm_message_manager_t *manager)
+{
+    size_t index;
+
+    for (index = 0u; index < manager->pending_capacity; ++index) {
+        if (manager->pending_storage[index].active == 0) {
+            return &manager->pending_storage[index];
+        }
+    }
+
+    return NULL;
+}
+
+/*
+ * 检查所有活动 pending 是否符合 manager 自己能够产生的状态。
+ * 除字段范围外还检查 sequence 唯一性，否则收到回复时无法确定应移除哪一项。
+ */
+static int comm_message_manager_has_valid_pending_state(
+    const comm_message_manager_t *manager)
+{
+    size_t index;
+    size_t other_index;
+    const comm_message_pending_t *pending;
+
+    if (!comm_message_manager_has_valid_configuration(manager) ||
+        (manager->next_sequence == 0u)) {
+        return 0;
+    }
+
+    for (index = 0u; index < manager->pending_capacity; ++index) {
+        pending = &manager->pending_storage[index];
+
+        if ((pending->active != 0) && (pending->active != 1)) {
+            return 0;
+        }
+
+        if (pending->active == 0) {
+            continue;
+        }
+
+        if ((pending->request.version != COMM_FRAME_VERSION) ||
+            (pending->request.type != COMM_FRAME_TYPE_REQUEST) ||
+            (pending->request.sequence == 0u) ||
+            (pending->request.payload_length > COMM_FRAME_MAX_PAYLOAD_SIZE) ||
+            (pending->retries_done > manager->config.max_retries)) {
+            return 0;
+        }
+
+        for (other_index = index + 1u;
+             other_index < manager->pending_capacity;
+             ++other_index) {
+            if ((manager->pending_storage[other_index].active == 1) &&
+                (manager->pending_storage[other_index].request.sequence ==
+                 pending->request.sequence)) {
+                return 0;
+            }
+        }
+    }
+
+    return 1;
+}
+
+/*
+ * 计算回复截止时间，并在 uint64_t 加法将溢出时饱和到 UINT64_MAX。
+ * 正常单调毫秒时钟几乎不可能走到该边界，但显式处理可避免整数绕回后把
+ * 新请求误判为已经超时。
+ */
+static uint64_t comm_message_manager_make_deadline(
+    uint64_t now_ms,
+    uint32_t timeout_ms)
+{
+    if (now_ms > (UINT64_MAX - (uint64_t)timeout_ms)) {
+        return UINT64_MAX;
+    }
+
+    return now_ms + (uint64_t)timeout_ms;
+}
+
 /* 将平台无关通道结果转换成消息管理器自己的结果空间。 */
 static comm_message_manager_result_t comm_message_manager_map_channel_result(
     comm_frame_channel_result_t result)
@@ -204,6 +311,91 @@ comm_message_manager_result_t comm_message_manager_send_response(
                                            sequence,
                                            payload,
                                            payload_length);
+}
+
+comm_message_manager_result_t comm_message_manager_send_request(
+    comm_message_manager_t *manager,
+    const uint8_t *payload,
+    size_t payload_length,
+    uint64_t now_ms,
+    uint16_t *sequence)
+{
+    comm_message_pending_t *pending;
+    comm_frame_t frame;
+    comm_frame_channel_result_t channel_result;
+    uint16_t candidate;
+    uint32_t attempts;
+
+    if ((manager == NULL) || (sequence == NULL)) {
+        return COMM_MESSAGE_MANAGER_NULL_ARGUMENT;
+    }
+
+    if ((payload_length > 0u) && (payload == NULL)) {
+        return COMM_MESSAGE_MANAGER_NULL_ARGUMENT;
+    }
+
+    if (!comm_message_manager_has_valid_pending_state(manager)) {
+        return COMM_MESSAGE_MANAGER_INVALID_STATE;
+    }
+
+    if (payload_length > COMM_FRAME_MAX_PAYLOAD_SIZE) {
+        return COMM_MESSAGE_MANAGER_PAYLOAD_TOO_LARGE;
+    }
+
+    pending = comm_message_manager_find_free_pending(manager);
+    if (pending == NULL) {
+        return COMM_MESSAGE_MANAGER_PENDING_FULL;
+    }
+
+    /*
+     * 从 next_sequence 开始寻找未被占用的非零序号。最多检查 UINT16_MAX
+     * 个候选值；若全部都处于 pending，说明当前没有可安全分配的序号。
+     */
+    candidate = manager->next_sequence;
+    for (attempts = 0u; attempts < (uint32_t)UINT16_MAX; ++attempts) {
+        if (!comm_message_manager_sequence_is_active(manager, candidate)) {
+            break;
+        }
+
+        candidate = comm_message_manager_next_sequence(candidate);
+    }
+
+    if (attempts == (uint32_t)UINT16_MAX) {
+        return COMM_MESSAGE_MANAGER_SEQUENCE_EXHAUSTED;
+    }
+
+    memset(&frame, 0, sizeof(frame));
+    frame.version = COMM_FRAME_VERSION;
+    frame.type = COMM_FRAME_TYPE_REQUEST;
+    frame.sequence = candidate;
+    frame.payload_length = (uint16_t)payload_length;
+    if (payload_length > 0u) {
+        memcpy(frame.payload, payload, payload_length);
+    }
+
+    channel_result = comm_frame_channel_push(
+        manager->tx_channel,
+        &frame,
+        manager->config.send_timeout_ms);
+    if (channel_result != COMM_FRAME_CHANNEL_OK) {
+        return comm_message_manager_map_channel_result(channel_result);
+    }
+
+    /*
+     * 通道确认接收后才提交 pending。active 最后写入，使槽位在完整字段就绪前
+     * 始终保持无效。manager 由单一任务调用，因此这里不需要额外互斥锁。
+     */
+    pending->request = frame;
+    pending->deadline_ms = comm_message_manager_make_deadline(
+        now_ms,
+        manager->config.response_timeout_ms);
+    pending->retries_done = 0u;
+    pending->active = 1;
+
+    manager->next_sequence = comm_message_manager_next_sequence(candidate);
+    *sequence = candidate;
+
+    return COMM_MESSAGE_MANAGER_OK;
 }
 
 comm_message_manager_result_t comm_message_manager_send_report(
