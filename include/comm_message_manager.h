@@ -62,6 +62,8 @@ typedef void (*comm_message_event_fn)(void *context,
  *
  * request 保存初次发送的完整请求帧，重试时保持相同 sequence 原样发送。
  * deadline_ms 使用调用方提供的单调毫秒时间，与具体 Linux/RTOS 时钟无关。
+ * retries_done 已重试次数
+ * active 标记该 pending 是否仍然有效。
  * 所有字段由消息管理器维护，调用方不应直接修改。
  */
 typedef struct {
