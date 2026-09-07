@@ -1,6 +1,7 @@
 #include "comm_message_manager.h"
 
 #include <stddef.h>
+#include <string.h>
 
 /*
  * manager 只保存通道地址，不拥有通道。初始化时必须确认这个地址当前指向
@@ -49,6 +50,85 @@ static void comm_message_manager_clear_pending(
     for (index = 0u; index < pending_capacity; ++index) {
         pending_storage[index].active = 0;
     }
+}
+
+/* 将平台无关通道结果转换成消息管理器自己的结果空间。 */
+static comm_message_manager_result_t comm_message_manager_map_channel_result(
+    comm_frame_channel_result_t result)
+{
+    switch (result) {
+        case COMM_FRAME_CHANNEL_OK:
+            return COMM_MESSAGE_MANAGER_OK;
+
+        case COMM_FRAME_CHANNEL_TIMEOUT:
+            return COMM_MESSAGE_MANAGER_CHANNEL_TIMEOUT;
+
+        case COMM_FRAME_CHANNEL_CLOSED:
+            return COMM_MESSAGE_MANAGER_CHANNEL_CLOSED;
+
+        case COMM_FRAME_CHANNEL_NULL_ARGUMENT:
+        case COMM_FRAME_CHANNEL_INVALID_STATE:
+        case COMM_FRAME_CHANNEL_BACKEND_ERROR:
+        default:
+            return COMM_MESSAGE_MANAGER_CHANNEL_ERROR;
+    }
+}
+
+/*
+ * 构造并发送一帧不需要登记 pending 的消息。
+ *
+ * 局部 frame 必须整体清零后再填写字段。虽然只有 payload_length 个负载字节
+ * 具有协议意义，但帧队列会复制整个 comm_frame_t；清零可以避免把栈中未初始
+ * 化的 payload 尾部字节带入队列，也让不同平台上的测试结果保持确定。
+ */
+static comm_message_manager_result_t comm_message_manager_send_frame(
+    comm_message_manager_t *manager,
+    uint8_t type,
+    uint16_t sequence,
+    const uint8_t *payload,
+    size_t payload_length)
+{
+    comm_frame_t frame;
+    comm_frame_channel_result_t channel_result;
+
+    if (manager == NULL) {
+        return COMM_MESSAGE_MANAGER_NULL_ARGUMENT;
+    }
+
+    if ((payload_length > 0u) && (payload == NULL)) {
+        return COMM_MESSAGE_MANAGER_NULL_ARGUMENT;
+    }
+
+    if (!comm_message_manager_has_valid_configuration(manager)) {
+        return COMM_MESSAGE_MANAGER_INVALID_STATE;
+    }
+
+    if (payload_length > COMM_FRAME_MAX_PAYLOAD_SIZE) {
+        return COMM_MESSAGE_MANAGER_PAYLOAD_TOO_LARGE;
+    }
+
+    if (((type == COMM_FRAME_TYPE_RESPONSE) ||
+         (type == COMM_FRAME_TYPE_ERROR)) &&
+        (sequence == 0u)) {
+        return COMM_MESSAGE_MANAGER_INVALID_SEQUENCE;
+    }
+
+    memset(&frame, 0, sizeof(frame));
+    frame.version = COMM_FRAME_VERSION;
+    frame.type = type;
+    frame.sequence = sequence;
+    frame.payload_length = (uint16_t)payload_length;
+
+    if (payload_length > 0u) {
+        memcpy(frame.payload, payload, payload_length);
+    }
+
+    channel_result = comm_frame_channel_push(
+        manager->tx_channel,
+        &frame,
+        manager->config.send_timeout_ms);
+
+    return comm_message_manager_map_channel_result(channel_result);
 }
 
 comm_message_manager_result_t comm_message_manager_init(
@@ -111,4 +191,42 @@ comm_message_manager_result_t comm_message_manager_reset(
     manager->next_sequence = 1u;
 
     return COMM_MESSAGE_MANAGER_OK;
+}
+
+comm_message_manager_result_t comm_message_manager_send_response(
+    comm_message_manager_t *manager,
+    uint16_t sequence,
+    const uint8_t *payload,
+    size_t payload_length)
+{
+    return comm_message_manager_send_frame(manager,
+                                           COMM_FRAME_TYPE_RESPONSE,
+                                           sequence,
+                                           payload,
+                                           payload_length);
+}
+
+comm_message_manager_result_t comm_message_manager_send_report(
+    comm_message_manager_t *manager,
+    const uint8_t *payload,
+    size_t payload_length)
+{
+    return comm_message_manager_send_frame(manager,
+                                           COMM_FRAME_TYPE_REPORT,
+                                           0u,
+                                           payload,
+                                           payload_length);
+}
+
+comm_message_manager_result_t comm_message_manager_send_error(
+    comm_message_manager_t *manager,
+    uint16_t sequence,
+    const uint8_t *payload,
+    size_t payload_length)
+{
+    return comm_message_manager_send_frame(manager,
+                                           COMM_FRAME_TYPE_ERROR,
+                                           sequence,
+                                           payload,
+                                           payload_length);
 }

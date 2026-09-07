@@ -13,6 +13,7 @@ typedef enum {
     COMM_MESSAGE_MANAGER_INVALID_CONFIG,
     COMM_MESSAGE_MANAGER_INVALID_STATE,
     COMM_MESSAGE_MANAGER_PAYLOAD_TOO_LARGE,
+    COMM_MESSAGE_MANAGER_INVALID_SEQUENCE,
     COMM_MESSAGE_MANAGER_PENDING_FULL,
     COMM_MESSAGE_MANAGER_SEQUENCE_EXHAUSTED,
     COMM_MESSAGE_MANAGER_UNSUPPORTED_FRAME_TYPE,
@@ -143,7 +144,7 @@ comm_message_manager_result_t comm_message_manager_send_request(
     uint64_t now_ms,
     uint16_t *sequence);
 
-/* 使用指定请求序号构造并发送 RESPONSE 帧。 */
+/* 使用指定的非零请求序号构造并发送 RESPONSE 帧。 */
 comm_message_manager_result_t comm_message_manager_send_response(
     comm_message_manager_t *manager,
     uint16_t sequence,
@@ -156,7 +157,7 @@ comm_message_manager_result_t comm_message_manager_send_report(
     const uint8_t *payload,
     size_t payload_length);
 
-/* 使用指定请求序号构造并发送 ERROR 帧。 */
+/* 使用指定的非零请求序号构造并发送 ERROR 帧。 */
 comm_message_manager_result_t comm_message_manager_send_error(
     comm_message_manager_t *manager,
     uint16_t sequence,
