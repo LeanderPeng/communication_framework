@@ -130,3 +130,32 @@ comm_frame_queue_result_t comm_frame_queue_push(comm_frame_queue_t *queue,
 
     return COMM_FRAME_QUEUE_OK;
 }
+
+comm_frame_queue_result_t comm_frame_queue_pop(comm_frame_queue_t *queue,
+                                               comm_frame_t *frame)
+{
+    if (queue == NULL) {
+        return COMM_FRAME_QUEUE_NULL_ARGUMENT;
+    }
+
+    if (!comm_frame_queue_state_is_valid(queue)) {
+        return COMM_FRAME_QUEUE_INVALID_STATE;
+    }
+
+    if (frame == NULL) {
+        return COMM_FRAME_QUEUE_NULL_ARGUMENT;
+    }
+
+    if (queue->used == 0u) {
+        return COMM_FRAME_QUEUE_EMPTY;
+    }
+
+    *frame = queue->storage[queue->read_index];
+    queue->read_index = comm_frame_queue_advance_index(
+        queue->read_index,
+        1u,
+        queue->capacity);
+    queue->used -= 1u;
+
+    return COMM_FRAME_QUEUE_OK;
+}

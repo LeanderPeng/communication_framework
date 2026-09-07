@@ -147,6 +147,19 @@ static void fill_frame(comm_frame_t *frame,
     memset(frame->payload, payload_value, sizeof(frame->payload));
 }
 
+/* 逐字段比较帧，避免依赖结构体填充字节的具体内容。 */
+static int frames_are_equal(const comm_frame_t *left,
+                            const comm_frame_t *right)
+{
+    return (left->version == right->version) &&
+           (left->type == right->type) &&
+           (left->sequence == right->sequence) &&
+           (left->payload_length == right->payload_length) &&
+           (memcmp(left->payload,
+                   right->payload,
+                   sizeof(left->payload)) == 0);
+}
+
 /* 验证普通入队会复制整帧，而不是保存调用方的帧地址。 */
 static int test_push_copies_frame(void)
 {
@@ -288,6 +301,129 @@ static int test_push_rejects_invalid_request(void)
     return 0;
 }
 
+/* 验证出队按先进先出顺序返回完整的独立帧副本。 */
+static int test_pop_preserves_fifo_order(void)
+{
+    comm_frame_queue_t queue;
+    comm_frame_t storage[3];
+    comm_frame_t input[3];
+    comm_frame_t output;
+    size_t index;
+
+    TEST_CHECK(comm_frame_queue_init(&queue, storage, 3u) ==
+               COMM_FRAME_QUEUE_OK);
+
+    for (index = 0u; index < 3u; ++index) {
+        fill_frame(&input[index],
+                   (uint16_t)(0x1000u + index),
+                   (uint8_t)(0x20u + index));
+        TEST_CHECK(comm_frame_queue_push(&queue, &input[index]) ==
+                   COMM_FRAME_QUEUE_OK);
+    }
+
+    for (index = 0u; index < 3u; ++index) {
+        TEST_CHECK(comm_frame_queue_pop(&queue, &output) ==
+                   COMM_FRAME_QUEUE_OK);
+        TEST_CHECK(frames_are_equal(&output, &input[index]));
+        TEST_CHECK(queue.used == (2u - index));
+    }
+
+    TEST_CHECK(queue.read_index == 0u);
+    TEST_CHECK(queue.write_index == 0u);
+    TEST_CHECK(queue.used == 0u);
+    TEST_CHECK(comm_frame_queue_size(&queue) == 0u);
+    TEST_CHECK(comm_frame_queue_free_space(&queue) == 3u);
+
+    output.sequence = 0xFFFFu;
+    TEST_CHECK(storage[2].sequence == input[2].sequence);
+
+    return 0;
+}
+
+/* 验证出入队交错并绕回数组后，逻辑顺序仍保持不变。 */
+static int test_push_pop_wrap_cycle(void)
+{
+    comm_frame_queue_t queue;
+    comm_frame_t storage[3];
+    comm_frame_t input[5];
+    comm_frame_t output;
+    size_t index;
+
+    TEST_CHECK(comm_frame_queue_init(&queue, storage, 3u) ==
+               COMM_FRAME_QUEUE_OK);
+
+    for (index = 0u; index < 5u; ++index) {
+        fill_frame(&input[index],
+                   (uint16_t)(index + 1u),
+                   (uint8_t)(0x30u + index));
+    }
+
+    for (index = 0u; index < 3u; ++index) {
+        TEST_CHECK(comm_frame_queue_push(&queue, &input[index]) ==
+                   COMM_FRAME_QUEUE_OK);
+    }
+    for (index = 0u; index < 2u; ++index) {
+        TEST_CHECK(comm_frame_queue_pop(&queue, &output) ==
+                   COMM_FRAME_QUEUE_OK);
+        TEST_CHECK(frames_are_equal(&output, &input[index]));
+    }
+
+    TEST_CHECK(comm_frame_queue_push(&queue, &input[3]) ==
+               COMM_FRAME_QUEUE_OK);
+    TEST_CHECK(comm_frame_queue_push(&queue, &input[4]) ==
+               COMM_FRAME_QUEUE_OK);
+    TEST_CHECK(queue.read_index == 2u);
+    TEST_CHECK(queue.write_index == 2u);
+    TEST_CHECK(queue.used == 3u);
+
+    for (index = 2u; index < 5u; ++index) {
+        TEST_CHECK(comm_frame_queue_pop(&queue, &output) ==
+                   COMM_FRAME_QUEUE_OK);
+        TEST_CHECK(frames_are_equal(&output, &input[index]));
+    }
+
+    TEST_CHECK(queue.read_index == 2u);
+    TEST_CHECK(queue.write_index == 2u);
+    TEST_CHECK(queue.used == 0u);
+
+    return 0;
+}
+
+/* 验证参数、状态或空队列错误不会修改输出帧或队列状态。 */
+static int test_pop_rejects_invalid_request(void)
+{
+    comm_frame_queue_t queue;
+    comm_frame_t storage[2];
+    comm_frame_t output;
+    comm_frame_t expected_output;
+
+    TEST_CHECK(comm_frame_queue_init(&queue, storage, 2u) ==
+               COMM_FRAME_QUEUE_OK);
+    fill_frame(&output, 0x1234u, 0x5Au);
+    expected_output = output;
+
+    TEST_CHECK(comm_frame_queue_pop(NULL, &output) ==
+               COMM_FRAME_QUEUE_NULL_ARGUMENT);
+    TEST_CHECK(comm_frame_queue_pop(&queue, NULL) ==
+               COMM_FRAME_QUEUE_NULL_ARGUMENT);
+    TEST_CHECK(comm_frame_queue_pop(&queue, &output) ==
+               COMM_FRAME_QUEUE_EMPTY);
+    TEST_CHECK(frames_are_equal(&output, &expected_output));
+    TEST_CHECK(queue.read_index == 0u);
+    TEST_CHECK(queue.write_index == 0u);
+    TEST_CHECK(queue.used == 0u);
+
+    queue.write_index = 1u;
+    TEST_CHECK(comm_frame_queue_pop(&queue, &output) ==
+               COMM_FRAME_QUEUE_INVALID_STATE);
+    TEST_CHECK(frames_are_equal(&output, &expected_output));
+    TEST_CHECK(queue.read_index == 0u);
+    TEST_CHECK(queue.write_index == 1u);
+    TEST_CHECK(queue.used == 0u);
+
+    return 0;
+}
+
 int main(void)
 {
     if (test_init_validation() != 0) {
@@ -312,6 +448,15 @@ int main(void)
         return 1;
     }
     if (test_push_rejects_invalid_request() != 0) {
+        return 1;
+    }
+    if (test_pop_preserves_fifo_order() != 0) {
+        return 1;
+    }
+    if (test_push_pop_wrap_cycle() != 0) {
+        return 1;
+    }
+    if (test_pop_rejects_invalid_request() != 0) {
         return 1;
     }
 
