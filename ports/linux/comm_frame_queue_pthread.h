@@ -62,7 +62,8 @@ comm_frame_queue_pthread_result_t comm_frame_queue_pthread_close(
 /*
  * 等待可用槽位并复制一帧到队尾。
  * timeout_ms 为 0 时立即尝试；为 WAIT_FOREVER 时永久等待；其他值表示
- * 从调用开始计算的最大等待毫秒数。
+ * 从调用开始计算的最大等待毫秒数。有限等待使用单调时钟计算，不受
+ * 系统日期和时间被校准的影响。
  */
 comm_frame_queue_pthread_result_t comm_frame_queue_pthread_push(
     comm_frame_queue_pthread_t *queue,
