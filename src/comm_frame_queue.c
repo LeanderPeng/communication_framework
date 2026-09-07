@@ -101,3 +101,32 @@ size_t comm_frame_queue_free_space(const comm_frame_queue_t *queue)
 
     return queue->capacity - queue->used;
 }
+
+comm_frame_queue_result_t comm_frame_queue_push(comm_frame_queue_t *queue,
+                                                const comm_frame_t *frame)
+{
+    if (queue == NULL) {
+        return COMM_FRAME_QUEUE_NULL_ARGUMENT;
+    }
+
+    if (!comm_frame_queue_state_is_valid(queue)) {
+        return COMM_FRAME_QUEUE_INVALID_STATE;
+    }
+
+    if (frame == NULL) {
+        return COMM_FRAME_QUEUE_NULL_ARGUMENT;
+    }
+
+    if (queue->used == queue->capacity) {
+        return COMM_FRAME_QUEUE_FULL;
+    }
+
+    queue->storage[queue->write_index] = *frame;
+    queue->write_index = comm_frame_queue_advance_index(
+        queue->write_index,
+        1u,
+        queue->capacity);
+    queue->used += 1u;
+
+    return COMM_FRAME_QUEUE_OK;
+}
