@@ -529,3 +529,89 @@ comm_message_manager_result_t comm_message_manager_handle_frame(
     manager->event_callback(manager->event_context, &event);
     return COMM_MESSAGE_MANAGER_OK;
 }
+
+comm_message_manager_result_t comm_message_manager_process_timeouts(
+    comm_message_manager_t *manager,
+    uint64_t now_ms)
+{
+    comm_message_manager_result_t overall_result = COMM_MESSAGE_MANAGER_OK;
+    comm_message_manager_result_t retry_result;
+    comm_frame_channel_result_t channel_result;
+    comm_message_pending_t *pending;
+    comm_message_event_t event;
+    size_t index;
+
+    if (manager == NULL) {
+        return COMM_MESSAGE_MANAGER_NULL_ARGUMENT;
+    }
+
+    if (!comm_message_manager_has_valid_pending_state(manager)) {
+        return COMM_MESSAGE_MANAGER_INVALID_STATE;
+    }
+
+    for (index = 0u; index < manager->pending_capacity; ++index) {
+        pending = &manager->pending_storage[index];
+
+        /*
+         * inactive 槽位没有正在等待的请求；now_ms 小于 deadline_ms 则说明
+         * 回复等待窗口尚未结束。两种情况都不能修改槽位。
+         *
+         * 使用 now_ms >= deadline_ms 判断到期，因此正好走到截止时刻就会处理。
+         * deadline_ms 由饱和加法生成，不会因 uint64_t 溢出绕回到很小的值。
+         */
+        if ((pending->active == 0) || (now_ms < pending->deadline_ms)) {
+            continue;
+        }
+
+        if (pending->retries_done >= manager->config.max_retries) {
+            /*
+             * 初次发送不计入 retries_done。当已重发次数达到 max_retries 后，
+             * 本次到期不再尝试发送，而是结束事务并报告最终超时。
+             */
+            event.type = COMM_MESSAGE_EVENT_REQUEST_TIMEOUT;
+            event.frame = pending->request;
+            event.retries_done = pending->retries_done;
+
+            /*
+             * 与收到匹配回复时相同，先清除 active 再调用同步回调。回调看到
+             * REQUEST_TIMEOUT 时，对应 sequence 已经不再占用 pending 槽位。
+             */
+            pending->active = 0;
+            manager->event_callback(manager->event_context, &event);
+            continue;
+        }
+
+        /*
+         * 重发保存下来的原始 REQUEST，尤其不能分配新 sequence。对端可能只是
+         * 回复较慢；保持 sequence 不变，迟到回复和本次重发的回复都能结束同一
+         * 个 pending 请求事务。
+         */
+        channel_result = comm_frame_channel_push(
+            manager->tx_channel,
+            &pending->request,
+            manager->config.send_timeout_ms);
+        retry_result = comm_message_manager_map_channel_result(channel_result);
+
+        if (retry_result != COMM_MESSAGE_MANAGER_OK) {
+            /*
+             * 通道没有接收帧，所以这不算一次成功重发：不增加次数、不刷新
+             * deadline，也不释放 pending。继续检查其他槽位，避免它们被阻挡。
+             */
+            if (overall_result == COMM_MESSAGE_MANAGER_OK) {
+                overall_result = retry_result;
+            }
+            continue;
+        }
+
+        /*
+         * 通道确认接收后才提交新的重试状态。新的等待窗口从本次调用提供的
+         * now_ms 开始，而不是从旧 deadline 延伸，避免任务调度较晚时连续补发。
+         */
+        pending->retries_done = (uint8_t)(pending->retries_done + 1u);
+        pending->deadline_ms = comm_message_manager_make_deadline(
+            now_ms,
+            manager->config.response_timeout_ms);
+    }
+
+    return overall_result;
+}

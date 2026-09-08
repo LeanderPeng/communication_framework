@@ -195,6 +195,14 @@ comm_message_manager_result_t comm_message_manager_handle_frame(
  * 到达截止时间且仍可重试时，以相同 sequence 重发原请求并更新截止时间；
  * 已达到 max_retries 时移除 pending，并产生 REQUEST_TIMEOUT 事件。
  * max_retries 只计算初次发送之后的重发次数。
+ *
+ * 未到期的 pending 不会发生变化。重发成功后才增加 retries_done，并从本次
+ * now_ms 重新计算 deadline_ms；重发本身不产生事件。若通道拒绝某次重发，
+ * 该 pending 保持到期状态，调用方可以稍后再次调用本函数。
+ *
+ * 一次调用会继续检查所有 pending，避免某个重发失败的请求阻挡其他请求完成
+ * 超时处理；若发生一个或多个通道错误，返回遍历中遇到的第一个错误。此前已
+ * 成功完成的重发或 REQUEST_TIMEOUT 事件不会回滚。
  */
 comm_message_manager_result_t comm_message_manager_process_timeouts(
     comm_message_manager_t *manager,

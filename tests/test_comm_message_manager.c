@@ -994,6 +994,244 @@ static int test_handle_frame_validation(void)
     return 0;
 }
 
+/*
+ * 验证未到期时不处理、到期后保持原 sequence 重发，以及用尽重试次数后
+ * 释放 pending 并产生 REQUEST_TIMEOUT 事件。
+ */
+static int test_process_timeouts_retry_and_final_timeout(void)
+{
+    comm_message_manager_t manager;
+    comm_frame_channel_t channel;
+    comm_message_pending_t pending[2];
+    comm_message_manager_config_t config;
+    fake_channel_backend_t backend;
+    fake_event_recorder_t recorder;
+    comm_frame_t original_request;
+    uint16_t sequence;
+
+    memset(&backend, 0, sizeof(backend));
+    memset(&recorder, 0, sizeof(recorder));
+    config.response_timeout_ms = 100u;
+    config.send_timeout_ms = 25u;
+    config.max_retries = 2u;
+    TEST_CHECK(make_bound_channel(&channel, &backend));
+    TEST_CHECK(comm_message_manager_init(&manager,
+                                         &channel,
+                                         pending,
+                                         2u,
+                                         &config,
+                                         record_event_callback,
+                                         &recorder) ==
+               COMM_MESSAGE_MANAGER_OK);
+    recorder.manager = &manager;
+
+    TEST_CHECK(comm_message_manager_send_request(&manager,
+                                                 NULL,
+                                                 0u,
+                                                 1000u,
+                                                 &sequence) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(sequence == 1u);
+    original_request = pending[0].request;
+    TEST_CHECK(pending[0].deadline_ms == 1100u);
+    TEST_CHECK(backend.push_count == 1u);
+
+    /* deadline 之前不重发；正好等于 deadline 时视为已经到期。 */
+    TEST_CHECK(comm_message_manager_process_timeouts(&manager, 1099u) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(backend.push_count == 1u);
+    TEST_CHECK(pending[0].retries_done == 0u);
+    TEST_CHECK(pending[0].deadline_ms == 1100u);
+    TEST_CHECK(recorder.event_count == 0u);
+
+    TEST_CHECK(comm_message_manager_process_timeouts(&manager, 1100u) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(backend.push_count == 2u);
+    TEST_CHECK(backend.timeout_ms == config.send_timeout_ms);
+    TEST_CHECK(memcmp(&backend.pushed_frame,
+                      &original_request,
+                      sizeof(original_request)) == 0);
+    TEST_CHECK(backend.pushed_frame.sequence == sequence);
+    TEST_CHECK(pending[0].active == 1);
+    TEST_CHECK(pending[0].retries_done == 1u);
+    TEST_CHECK(pending[0].deadline_ms == 1200u);
+    TEST_CHECK(recorder.event_count == 0u);
+
+    TEST_CHECK(comm_message_manager_process_timeouts(&manager, 1200u) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(backend.push_count == 3u);
+    TEST_CHECK(backend.pushed_frame.sequence == sequence);
+    TEST_CHECK(pending[0].active == 1);
+    TEST_CHECK(pending[0].retries_done == 2u);
+    TEST_CHECK(pending[0].deadline_ms == 1300u);
+    TEST_CHECK(recorder.event_count == 0u);
+
+    /* 已完成两次允许的重发，第三次到期直接结束事务，不再向通道发送。 */
+    TEST_CHECK(comm_message_manager_process_timeouts(&manager, 1300u) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(backend.push_count == 3u);
+    TEST_CHECK(pending[0].active == 0);
+    TEST_CHECK(recorder.event_count == 1u);
+    TEST_CHECK(recorder.last_event.type ==
+               COMM_MESSAGE_EVENT_REQUEST_TIMEOUT);
+    TEST_CHECK(memcmp(&recorder.last_event.frame,
+                      &original_request,
+                      sizeof(original_request)) == 0);
+    TEST_CHECK(recorder.last_event.retries_done == 2u);
+    TEST_CHECK(recorder.matched_sequence_was_active_during_callback == 0);
+
+    /* 已释放槽位不会重复产生超时事件。 */
+    TEST_CHECK(comm_message_manager_process_timeouts(&manager, 1400u) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(backend.push_count == 3u);
+    TEST_CHECK(recorder.event_count == 1u);
+
+    return 0;
+}
+
+/*
+ * 验证重发失败不计次数、不刷新 deadline，同时仍会继续处理其他到期 pending；
+ * 通道恢复后，同一请求还可以继续正常重发并最终超时。
+ */
+static int test_process_timeouts_channel_failure(void)
+{
+    comm_message_manager_t manager;
+    comm_frame_channel_t channel;
+    comm_message_pending_t pending[2];
+    comm_message_manager_config_t config;
+    fake_channel_backend_t backend;
+    fake_event_recorder_t recorder;
+    uint16_t first_sequence;
+    uint16_t second_sequence;
+
+    memset(&backend, 0, sizeof(backend));
+    memset(&recorder, 0, sizeof(recorder));
+    config.response_timeout_ms = 100u;
+    config.send_timeout_ms = 25u;
+    config.max_retries = 1u;
+    TEST_CHECK(make_bound_channel(&channel, &backend));
+    TEST_CHECK(comm_message_manager_init(&manager,
+                                         &channel,
+                                         pending,
+                                         2u,
+                                         &config,
+                                         record_event_callback,
+                                         &recorder) ==
+               COMM_MESSAGE_MANAGER_OK);
+
+    TEST_CHECK(comm_message_manager_send_request(&manager,
+                                                 NULL,
+                                                 0u,
+                                                 1000u,
+                                                 &first_sequence) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(comm_message_manager_send_request(&manager,
+                                                 NULL,
+                                                 0u,
+                                                 1000u,
+                                                 &second_sequence) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(first_sequence == 1u);
+    TEST_CHECK(second_sequence == 2u);
+
+    /* 第二项已经用尽重试次数，本轮即使第一项发送失败也必须继续处理它。 */
+    pending[1].retries_done = 1u;
+    backend.push_result = COMM_FRAME_CHANNEL_TIMEOUT;
+    TEST_CHECK(comm_message_manager_process_timeouts(&manager, 1100u) ==
+               COMM_MESSAGE_MANAGER_CHANNEL_TIMEOUT);
+    TEST_CHECK(backend.push_count == 3u);
+    TEST_CHECK(pending[0].active == 1);
+    TEST_CHECK(pending[0].retries_done == 0u);
+    TEST_CHECK(pending[0].deadline_ms == 1100u);
+    TEST_CHECK(pending[1].active == 0);
+    TEST_CHECK(recorder.event_count == 1u);
+    TEST_CHECK(recorder.last_event.type ==
+               COMM_MESSAGE_EVENT_REQUEST_TIMEOUT);
+    TEST_CHECK(recorder.last_event.frame.sequence == second_sequence);
+    TEST_CHECK(recorder.last_event.retries_done == 1u);
+
+    backend.push_result = COMM_FRAME_CHANNEL_CLOSED;
+    TEST_CHECK(comm_message_manager_process_timeouts(&manager, 1100u) ==
+               COMM_MESSAGE_MANAGER_CHANNEL_CLOSED);
+    TEST_CHECK(backend.push_count == 4u);
+    TEST_CHECK(pending[0].active == 1);
+    TEST_CHECK(pending[0].retries_done == 0u);
+    TEST_CHECK(pending[0].deadline_ms == 1100u);
+
+    backend.push_result = COMM_FRAME_CHANNEL_BACKEND_ERROR;
+    TEST_CHECK(comm_message_manager_process_timeouts(&manager, 1100u) ==
+               COMM_MESSAGE_MANAGER_CHANNEL_ERROR);
+    TEST_CHECK(backend.push_count == 5u);
+    TEST_CHECK(pending[0].active == 1);
+    TEST_CHECK(pending[0].retries_done == 0u);
+
+    /* 通道恢复后，这次重发才真正记入 retries_done 并开启新的等待窗口。 */
+    backend.push_result = COMM_FRAME_CHANNEL_OK;
+    TEST_CHECK(comm_message_manager_process_timeouts(&manager, 1100u) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(backend.push_count == 6u);
+    TEST_CHECK(backend.pushed_frame.sequence == first_sequence);
+    TEST_CHECK(pending[0].active == 1);
+    TEST_CHECK(pending[0].retries_done == 1u);
+    TEST_CHECK(pending[0].deadline_ms == 1200u);
+
+    TEST_CHECK(comm_message_manager_process_timeouts(&manager, 1200u) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(backend.push_count == 6u);
+    TEST_CHECK(pending[0].active == 0);
+    TEST_CHECK(recorder.event_count == 2u);
+    TEST_CHECK(recorder.last_event.type ==
+               COMM_MESSAGE_EVENT_REQUEST_TIMEOUT);
+    TEST_CHECK(recorder.last_event.frame.sequence == first_sequence);
+    TEST_CHECK(recorder.last_event.retries_done == 1u);
+
+    return 0;
+}
+
+/* 验证超时处理的参数和 manager 状态错误不会发送帧或产生事件。 */
+static int test_process_timeouts_validation(void)
+{
+    comm_message_manager_t manager;
+    comm_message_manager_t uninitialized_manager;
+    comm_frame_channel_t channel;
+    comm_message_pending_t pending[1];
+    comm_message_manager_config_t config;
+    fake_channel_backend_t backend;
+    fake_event_recorder_t recorder;
+
+    memset(&uninitialized_manager, 0, sizeof(uninitialized_manager));
+    memset(&backend, 0, sizeof(backend));
+    memset(&recorder, 0, sizeof(recorder));
+    config.response_timeout_ms = 100u;
+    config.send_timeout_ms = 10u;
+    config.max_retries = 0u;
+    TEST_CHECK(make_bound_channel(&channel, &backend));
+    TEST_CHECK(comm_message_manager_init(&manager,
+                                         &channel,
+                                         pending,
+                                         1u,
+                                         &config,
+                                         record_event_callback,
+                                         &recorder) ==
+               COMM_MESSAGE_MANAGER_OK);
+
+    TEST_CHECK(comm_message_manager_process_timeouts(NULL, 0u) ==
+               COMM_MESSAGE_MANAGER_NULL_ARGUMENT);
+    TEST_CHECK(comm_message_manager_process_timeouts(&uninitialized_manager,
+                                                     0u) ==
+               COMM_MESSAGE_MANAGER_INVALID_STATE);
+    TEST_CHECK(backend.push_count == 0u);
+    TEST_CHECK(recorder.event_count == 0u);
+
+    pending[0].active = 123;
+    TEST_CHECK(comm_message_manager_process_timeouts(&manager, 0u) ==
+               COMM_MESSAGE_MANAGER_INVALID_STATE);
+    TEST_CHECK(backend.push_count == 0u);
+    TEST_CHECK(recorder.event_count == 0u);
+
+    return 0;
+}
+
 int main(void)
 {
     if (test_init_validation() != 0) {
@@ -1033,6 +1271,15 @@ int main(void)
         return 1;
     }
     if (test_handle_frame_validation() != 0) {
+        return 1;
+    }
+    if (test_process_timeouts_retry_and_final_timeout() != 0) {
+        return 1;
+    }
+    if (test_process_timeouts_channel_failure() != 0) {
+        return 1;
+    }
+    if (test_process_timeouts_validation() != 0) {
         return 1;
     }
 
