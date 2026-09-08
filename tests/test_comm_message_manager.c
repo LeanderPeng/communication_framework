@@ -59,6 +59,42 @@ static void fake_event_callback(void *context,
     (void)event;
 }
 
+/*
+ * 事件记录器复制同步回调参数，便于在回调返回后检查事件内容。
+ * manager 可选；提供时还会记录匹配 sequence 在回调执行期间是否仍为 active，
+ * 用来验证 handle_frame 确实先结束 pending 事务、再通知上层。
+ */
+typedef struct {
+    comm_message_event_t last_event;
+    size_t event_count;
+    comm_message_manager_t *manager;
+    int matched_sequence_was_active_during_callback;
+} fake_event_recorder_t;
+
+static void record_event_callback(void *context,
+                                  const comm_message_event_t *event)
+{
+    fake_event_recorder_t *recorder = (fake_event_recorder_t *)context;
+    size_t index;
+
+    recorder->last_event = *event;
+    recorder->event_count += 1u;
+    recorder->matched_sequence_was_active_during_callback = 0;
+
+    if (recorder->manager == NULL) {
+        return;
+    }
+
+    for (index = 0u; index < recorder->manager->pending_capacity; ++index) {
+        if ((recorder->manager->pending_storage[index].active == 1) &&
+            (recorder->manager->pending_storage[index].request.sequence ==
+             event->frame.sequence)) {
+            recorder->matched_sequence_was_active_during_callback = 1;
+            return;
+        }
+    }
+}
+
 static int make_bound_channel(comm_frame_channel_t *channel,
                               fake_channel_backend_t *backend)
 {
@@ -688,6 +724,276 @@ static int test_send_request_validation(void)
     return 0;
 }
 
+/* 验证对端 REQUEST 和主动 REPORT 直接产生事件，不占用 pending。 */
+static int test_handle_request_and_report(void)
+{
+    comm_message_manager_t manager;
+    comm_frame_channel_t channel;
+    comm_message_pending_t pending[2];
+    comm_message_manager_config_t config;
+    fake_channel_backend_t backend;
+    fake_event_recorder_t recorder;
+    comm_frame_t frame;
+
+    memset(&backend, 0, sizeof(backend));
+    memset(&recorder, 0, sizeof(recorder));
+    config.response_timeout_ms = 100u;
+    config.send_timeout_ms = 10u;
+    config.max_retries = 2u;
+    TEST_CHECK(make_bound_channel(&channel, &backend));
+    TEST_CHECK(comm_message_manager_init(&manager,
+                                         &channel,
+                                         pending,
+                                         2u,
+                                         &config,
+                                         record_event_callback,
+                                         &recorder) ==
+               COMM_MESSAGE_MANAGER_OK);
+
+    memset(&frame, 0, sizeof(frame));
+    frame.version = COMM_FRAME_VERSION;
+    frame.type = COMM_FRAME_TYPE_REQUEST;
+    frame.sequence = 0x1234u;
+    frame.payload_length = 2u;
+    frame.payload[0] = 0x10u;
+    frame.payload[1] = 0x20u;
+
+    TEST_CHECK(comm_message_manager_handle_frame(&manager, &frame) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(recorder.event_count == 1u);
+    TEST_CHECK(recorder.last_event.type ==
+               COMM_MESSAGE_EVENT_REQUEST_RECEIVED);
+    TEST_CHECK(memcmp(&recorder.last_event.frame,
+                      &frame,
+                      sizeof(frame)) == 0);
+    TEST_CHECK(recorder.last_event.retries_done == 0u);
+    TEST_CHECK(pending[0].active == 0);
+    TEST_CHECK(pending[1].active == 0);
+
+    memset(&frame, 0, sizeof(frame));
+    frame.version = COMM_FRAME_VERSION;
+    frame.type = COMM_FRAME_TYPE_REPORT;
+    frame.sequence = 0u;
+    frame.payload_length = 1u;
+    frame.payload[0] = 0x30u;
+
+    TEST_CHECK(comm_message_manager_handle_frame(&manager, &frame) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(recorder.event_count == 2u);
+    TEST_CHECK(recorder.last_event.type ==
+               COMM_MESSAGE_EVENT_REPORT_RECEIVED);
+    TEST_CHECK(recorder.last_event.frame.payload[0] == 0x30u);
+    TEST_CHECK(recorder.last_event.retries_done == 0u);
+    TEST_CHECK(pending[0].active == 0);
+    TEST_CHECK(pending[1].active == 0);
+
+    return 0;
+}
+
+/*
+ * 验证 RESPONSE/ERROR 通过 sequence 找到正确 pending，传播该请求的重试次数，
+ * 并且在进入事件回调之前释放对应槽位；其他并行请求不受影响。
+ */
+static int test_handle_matched_reply(void)
+{
+    comm_message_manager_t manager;
+    comm_frame_channel_t channel;
+    comm_message_pending_t pending[3];
+    comm_message_manager_config_t config;
+    fake_channel_backend_t backend;
+    fake_event_recorder_t recorder;
+    comm_frame_t frame;
+    uint16_t first_sequence;
+    uint16_t second_sequence;
+
+    memset(&backend, 0, sizeof(backend));
+    memset(&recorder, 0, sizeof(recorder));
+    config.response_timeout_ms = 100u;
+    config.send_timeout_ms = 10u;
+    config.max_retries = 2u;
+    TEST_CHECK(make_bound_channel(&channel, &backend));
+    TEST_CHECK(comm_message_manager_init(&manager,
+                                         &channel,
+                                         pending,
+                                         3u,
+                                         &config,
+                                         record_event_callback,
+                                         &recorder) ==
+               COMM_MESSAGE_MANAGER_OK);
+    recorder.manager = &manager;
+
+    TEST_CHECK(comm_message_manager_send_request(&manager,
+                                                 NULL,
+                                                 0u,
+                                                 1000u,
+                                                 &first_sequence) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(comm_message_manager_send_request(&manager,
+                                                 NULL,
+                                                 0u,
+                                                 1010u,
+                                                 &second_sequence) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(first_sequence == 1u);
+    TEST_CHECK(second_sequence == 2u);
+
+    /* 模拟第二个请求已经重发两次，并让它先于第一个请求收到回复。 */
+    pending[1].retries_done = 2u;
+    memset(&frame, 0, sizeof(frame));
+    frame.version = COMM_FRAME_VERSION;
+    frame.type = COMM_FRAME_TYPE_RESPONSE;
+    frame.sequence = second_sequence;
+    frame.payload_length = 1u;
+    frame.payload[0] = 0xA2u;
+
+    TEST_CHECK(comm_message_manager_handle_frame(&manager, &frame) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(recorder.event_count == 1u);
+    TEST_CHECK(recorder.last_event.type ==
+               COMM_MESSAGE_EVENT_RESPONSE_RECEIVED);
+    TEST_CHECK(recorder.last_event.frame.sequence == second_sequence);
+    TEST_CHECK(recorder.last_event.retries_done == 2u);
+    TEST_CHECK(recorder.matched_sequence_was_active_during_callback == 0);
+    TEST_CHECK(pending[0].active == 1);
+    TEST_CHECK(pending[1].active == 0);
+
+    pending[0].retries_done = 1u;
+    memset(&frame, 0, sizeof(frame));
+    frame.version = COMM_FRAME_VERSION;
+    frame.type = COMM_FRAME_TYPE_ERROR;
+    frame.sequence = first_sequence;
+    frame.payload_length = 1u;
+    frame.payload[0] = 0xE1u;
+
+    TEST_CHECK(comm_message_manager_handle_frame(&manager, &frame) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(recorder.event_count == 2u);
+    TEST_CHECK(recorder.last_event.type == COMM_MESSAGE_EVENT_ERROR_RECEIVED);
+    TEST_CHECK(recorder.last_event.frame.sequence == first_sequence);
+    TEST_CHECK(recorder.last_event.retries_done == 1u);
+    TEST_CHECK(recorder.matched_sequence_was_active_during_callback == 0);
+    TEST_CHECK(pending[0].active == 0);
+
+    return 0;
+}
+
+/* 验证未知、迟到或重复回复产生 UNMATCHED_REPLY，且不会误删其他请求。 */
+static int test_handle_unmatched_reply(void)
+{
+    comm_message_manager_t manager;
+    comm_frame_channel_t channel;
+    comm_message_pending_t pending[2];
+    comm_message_manager_config_t config;
+    fake_channel_backend_t backend;
+    fake_event_recorder_t recorder;
+    comm_frame_t frame;
+    uint16_t sequence;
+
+    memset(&backend, 0, sizeof(backend));
+    memset(&recorder, 0, sizeof(recorder));
+    config.response_timeout_ms = 100u;
+    config.send_timeout_ms = 10u;
+    config.max_retries = 1u;
+    TEST_CHECK(make_bound_channel(&channel, &backend));
+    TEST_CHECK(comm_message_manager_init(&manager,
+                                         &channel,
+                                         pending,
+                                         2u,
+                                         &config,
+                                         record_event_callback,
+                                         &recorder) ==
+               COMM_MESSAGE_MANAGER_OK);
+
+    TEST_CHECK(comm_message_manager_send_request(&manager,
+                                                 NULL,
+                                                 0u,
+                                                 1000u,
+                                                 &sequence) ==
+               COMM_MESSAGE_MANAGER_OK);
+
+    memset(&frame, 0, sizeof(frame));
+    frame.version = COMM_FRAME_VERSION;
+    frame.type = COMM_FRAME_TYPE_RESPONSE;
+    frame.sequence = 0x9999u;
+
+    TEST_CHECK(comm_message_manager_handle_frame(&manager, &frame) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(recorder.event_count == 1u);
+    TEST_CHECK(recorder.last_event.type ==
+               COMM_MESSAGE_EVENT_UNMATCHED_REPLY);
+    TEST_CHECK(recorder.last_event.frame.sequence == 0x9999u);
+    TEST_CHECK(recorder.last_event.retries_done == 0u);
+    TEST_CHECK(pending[0].active == 1);
+
+    /* 第一次匹配结束事务；同一帧再次到达时已经没有活动 pending。 */
+    frame.sequence = sequence;
+    TEST_CHECK(comm_message_manager_handle_frame(&manager, &frame) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(recorder.last_event.type ==
+               COMM_MESSAGE_EVENT_RESPONSE_RECEIVED);
+    TEST_CHECK(pending[0].active == 0);
+
+    TEST_CHECK(comm_message_manager_handle_frame(&manager, &frame) ==
+               COMM_MESSAGE_MANAGER_OK);
+    TEST_CHECK(recorder.event_count == 3u);
+    TEST_CHECK(recorder.last_event.type ==
+               COMM_MESSAGE_EVENT_UNMATCHED_REPLY);
+    TEST_CHECK(recorder.last_event.frame.sequence == sequence);
+
+    return 0;
+}
+
+/* 验证参数、manager 状态和未知帧类型错误都不会触发事件回调。 */
+static int test_handle_frame_validation(void)
+{
+    comm_message_manager_t manager;
+    comm_message_manager_t uninitialized_manager;
+    comm_frame_channel_t channel;
+    comm_message_pending_t pending[1];
+    comm_message_manager_config_t config;
+    fake_channel_backend_t backend;
+    fake_event_recorder_t recorder;
+    comm_frame_t frame;
+
+    memset(&uninitialized_manager, 0, sizeof(uninitialized_manager));
+    memset(&backend, 0, sizeof(backend));
+    memset(&recorder, 0, sizeof(recorder));
+    memset(&frame, 0, sizeof(frame));
+    config.response_timeout_ms = 100u;
+    config.send_timeout_ms = 10u;
+    config.max_retries = 1u;
+    TEST_CHECK(make_bound_channel(&channel, &backend));
+    TEST_CHECK(comm_message_manager_init(&manager,
+                                         &channel,
+                                         pending,
+                                         1u,
+                                         &config,
+                                         record_event_callback,
+                                         &recorder) ==
+               COMM_MESSAGE_MANAGER_OK);
+
+    frame.version = COMM_FRAME_VERSION;
+    frame.type = 0xFFu;
+    TEST_CHECK(comm_message_manager_handle_frame(NULL, &frame) ==
+               COMM_MESSAGE_MANAGER_NULL_ARGUMENT);
+    TEST_CHECK(comm_message_manager_handle_frame(&manager, NULL) ==
+               COMM_MESSAGE_MANAGER_NULL_ARGUMENT);
+    TEST_CHECK(comm_message_manager_handle_frame(&uninitialized_manager,
+                                                 &frame) ==
+               COMM_MESSAGE_MANAGER_INVALID_STATE);
+    TEST_CHECK(comm_message_manager_handle_frame(&manager, &frame) ==
+               COMM_MESSAGE_MANAGER_UNSUPPORTED_FRAME_TYPE);
+    TEST_CHECK(recorder.event_count == 0u);
+
+    pending[0].active = 123;
+    frame.type = COMM_FRAME_TYPE_REPORT;
+    TEST_CHECK(comm_message_manager_handle_frame(&manager, &frame) ==
+               COMM_MESSAGE_MANAGER_INVALID_STATE);
+    TEST_CHECK(recorder.event_count == 0u);
+
+    return 0;
+}
+
 int main(void)
 {
     if (test_init_validation() != 0) {
@@ -715,6 +1021,18 @@ int main(void)
         return 1;
     }
     if (test_send_request_validation() != 0) {
+        return 1;
+    }
+    if (test_handle_request_and_report() != 0) {
+        return 1;
+    }
+    if (test_handle_matched_reply() != 0) {
+        return 1;
+    }
+    if (test_handle_unmatched_reply() != 0) {
+        return 1;
+    }
+    if (test_handle_frame_validation() != 0) {
         return 1;
     }
 

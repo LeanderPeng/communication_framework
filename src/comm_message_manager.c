@@ -62,7 +62,12 @@ static uint16_t comm_message_manager_next_sequence(uint16_t sequence)
     return (uint16_t)(sequence + 1u);
 }
 
-/* 查找某个请求序号是否已经被活动 pending 占用。 */
+/*
+ * 查找某个请求序号是否已经被活动 pending 占用。
+ *
+ * next_sequence 只是分配游标，真正代表未完成事务的是活动 pending 中保存的
+ * request.sequence。新请求必须避开这些值，防止两个请求无法区分回复归属。
+ */
 static int comm_message_manager_sequence_is_active(
     const comm_message_manager_t *manager,
     uint16_t sequence)
@@ -77,6 +82,28 @@ static int comm_message_manager_sequence_is_active(
     }
 
     return 0;
+}
+
+/*
+ * 使用回复帧携带的 sequence 查找对应请求事务。
+ *
+ * RESPONSE/ERROR 不需要保存 pending 数组下标。只要双方在整个请求事务中保持
+ * sequence 不变，回复到达时就能在多个并行请求中找到正确的一项。
+ */
+static comm_message_pending_t *comm_message_manager_find_pending_by_sequence(
+    comm_message_manager_t *manager,
+    uint16_t sequence)
+{
+    size_t index;
+
+    for (index = 0u; index < manager->pending_capacity; ++index) {
+        if ((manager->pending_storage[index].active == 1) &&
+            (manager->pending_storage[index].request.sequence == sequence)) {
+            return &manager->pending_storage[index];
+        }
+    }
+
+    return NULL;
 }
 
 /* 返回第一个空闲 pending 槽位；全部占用时返回 NULL。 */
@@ -118,6 +145,7 @@ static int comm_message_manager_has_valid_pending_state(
         }
 
         if (pending->active == 0) {
+            /* active=0 时，其余内容都属于无效旧数据，不参与状态检查。 */
             continue;
         }
 
@@ -129,6 +157,7 @@ static int comm_message_manager_has_valid_pending_state(
             return 0;
         }
 
+        /* 活动 sequence 不能重复，否则无法判断回复属于哪一个请求。 */
         for (other_index = index + 1u;
              other_index < manager->pending_capacity;
              ++other_index) {
@@ -421,4 +450,82 @@ comm_message_manager_result_t comm_message_manager_send_error(
                                            sequence,
                                            payload,
                                            payload_length);
+}
+
+comm_message_manager_result_t comm_message_manager_handle_frame(
+    comm_message_manager_t *manager,
+    const comm_frame_t *frame)
+{
+    comm_message_event_t event;
+    comm_message_pending_t *pending = NULL;
+
+    if ((manager == NULL) || (frame == NULL)) {
+        return COMM_MESSAGE_MANAGER_NULL_ARGUMENT;
+    }
+
+    /*
+     * handle_frame 会读取和修改 pending，因此除了长期配置外，还必须确认活动
+     * pending 的内部状态有效。传入帧的版本、类型和长度已经由 Parser/Codec
+     * 校验，这里只处理请求、回复、上报和错误之间的消息语义。
+     */
+    if (!comm_message_manager_has_valid_pending_state(manager)) {
+        return COMM_MESSAGE_MANAGER_INVALID_STATE;
+    }
+
+    event.frame = *frame;
+    event.retries_done = 0u;
+
+    switch (frame->type) {
+        case COMM_FRAME_TYPE_REQUEST:
+            /*
+             * 对端请求不属于本端已经发出的事务，因此不查 pending，直接交给
+             * 上层业务处理。上层可使用同一个 sequence 发送 RESPONSE/ERROR。
+             */
+            event.type = COMM_MESSAGE_EVENT_REQUEST_RECEIVED;
+            break;
+
+        case COMM_FRAME_TYPE_REPORT:
+            /* 主动上报不要求请求与回复匹配，也不改变任何 pending。 */
+            event.type = COMM_MESSAGE_EVENT_REPORT_RECEIVED;
+            break;
+
+        case COMM_FRAME_TYPE_RESPONSE:
+        case COMM_FRAME_TYPE_ERROR:
+            /*
+             * sequence 是收到的回复与未完成请求之间的匹配键。可能存在多个
+             * 活动 pending，但有效状态保证它们的 sequence 互不重复。
+             */
+            pending = comm_message_manager_find_pending_by_sequence(
+                manager,
+                frame->sequence);
+
+            if (pending == NULL) {
+                /*
+                 * 未找到通常意味着回复迟到、重复到达，或者对端使用了本端
+                 * 从未分配的 sequence。保留原帧通知上层，便于诊断和统计。
+                 */
+                event.type = COMM_MESSAGE_EVENT_UNMATCHED_REPLY;
+                break;
+            }
+
+            event.retries_done = pending->retries_done;
+            event.type = (frame->type == COMM_FRAME_TYPE_RESPONSE)
+                             ? COMM_MESSAGE_EVENT_RESPONSE_RECEIVED
+                             : COMM_MESSAGE_EVENT_ERROR_RECEIVED;
+
+            /*
+             * 回复已经结束该请求事务。只需清除 active：其余字段成为旧数据，
+             * 后续新请求复用此槽位时会完整覆盖。先释放再回调，保证上层观察
+             * 到的 manager 状态与“已收到最终回复”一致。
+             */
+            pending->active = 0;
+            break;
+
+        default:
+            /* 正常 Parser 不会输出未知类型，保留检查防止接口被错误调用。 */
+            return COMM_MESSAGE_MANAGER_UNSUPPORTED_FRAME_TYPE;
+    }
+
+    manager->event_callback(manager->event_context, &event);
+    return COMM_MESSAGE_MANAGER_OK;
 }

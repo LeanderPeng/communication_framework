@@ -61,10 +61,19 @@ typedef void (*comm_message_event_fn)(void *context,
 /*
  * 调用方提供的一个 pending 请求槽位。
  *
- * request 保存初次发送的完整请求帧，重试时保持相同 sequence 原样发送。
+ * pending 表示一个“已经成功发送、但还没有收到最终回复”的请求事务，它不是
+ * 发送队列。request 保存初次发送的完整请求帧，重试时使用同一份帧，因此整个
+ * 请求事务始终保持相同的 sequence。
+ *
+ * sequence 相当于请求事务的匹配编号：收到 RESPONSE 或 ERROR 后，manager
+ * 使用回复帧的 sequence 查找 request.sequence 相同的活动 pending。找到表示
+ * 该回复属于这个请求，处理后把 active 清零；找不到则报告 UNMATCHED_REPLY。
+ * 多个 pending 可以同时活动，但它们的 sequence 必须各不相同。
+ *
  * deadline_ms 使用调用方提供的单调毫秒时间，与具体 Linux/RTOS 时钟无关。
- * retries_done 已重试次数
- * active 标记该 pending 是否仍然有效。
+ * retries_done 记录初次发送之后已经重发的次数，初次发送本身不计入。
+ * active 为 1 表示整个槽位有效，为 0 表示槽位空闲；空闲槽位中的其他字段
+ * 都只是上一次事务留下的旧数据，不能再读取其语义。
  * 所有字段由消息管理器维护，调用方不应直接修改。
  */
 typedef struct {
@@ -86,7 +95,9 @@ typedef struct {
  *
  * tx_channel      只负责发送完整帧，manager 不拥有也不关闭该通道。
  * pending_storage 由调用方提供，容量决定最多同时等待多少个请求回复。
- * next_sequence   保存下一次优先尝试的请求序号；0 永远不分配给请求。
+ * next_sequence   不是一个正在等待的请求，只是分配新 sequence 时首先尝试
+ *                 的候选值。若它已被活动 pending 占用，manager 会继续寻找；
+ *                 UINT16_MAX 之后绕回 1，0 永远不分配给请求。
  *
  * manager 本身不加锁，应该由一个固定任务串行调用。接收任务可以先把完整帧
  * 投递到线程安全队列，再由 manager 所属任务调用 handle_frame。这样 pending
@@ -170,6 +181,9 @@ comm_message_manager_result_t comm_message_manager_send_error(
  * REQUEST 和 REPORT 直接产生对应事件。RESPONSE 和 ERROR 使用 sequence
  * 查找 pending：找到后移除 pending 并产生匹配事件；找不到则产生
  * UNMATCHED_REPLY，用于识别迟到、重复或未知回复。
+ *
+ * 匹配成功时先把 pending 标记为空闲，再同步调用事件回调。这样回调开始执行
+ * 时，请求事务已经结束；回调仍然不能再次进入同一个 manager。
  */
 comm_message_manager_result_t comm_message_manager_handle_frame(
     comm_message_manager_t *manager,
