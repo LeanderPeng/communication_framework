@@ -3,11 +3,17 @@
 
 #include <stdint.h>
 
+#include "appliance_protocol.h"
+#include "comm_message_manager.h"
+
 /* Appliance Manager 对外接口的执行结果，成功固定为 0。 */
 typedef enum {
     APPLIANCE_MANAGER_OK = 0,
     APPLIANCE_MANAGER_NULL_ARGUMENT,
-    APPLIANCE_MANAGER_INVALID_STATE
+    APPLIANCE_MANAGER_INVALID_STATE,
+    APPLIANCE_MANAGER_UNSUPPORTED_EVENT,
+    APPLIANCE_MANAGER_UNSUPPORTED_MESSAGE,
+    APPLIANCE_MANAGER_MALFORMED_PAYLOAD
 } appliance_manager_result_t;
 
 /*
@@ -37,9 +43,9 @@ typedef enum {
 /*
  * 业务层持有的洗衣机状态快照。
  *
- * 该结构体同样不是线路字节布局，不能直接 memcpy 到通信 payload。后续会为
- * 业务 payload 明确定义字段偏移和大小端，再逐字段完成解析。这样既不受结构体
- * 填充影响，也不会把 UI 内部的数据表示误当成设备通信协议。
+ * 该结构体同样不是线路字节布局，不能直接 memcpy 到通信 payload。业务字节
+ * 布局由 appliance_protocol.h 单独定义，解析时逐字段读取。这样既不受结构体
+ * 填充和 CPU 字节序影响，也不会把 UI 数据表示误当成设备通信协议。
  *
  * progress_percent 的有效范围是 0..100；door_locked 只能是 0 或 1；
  * fault_code 为 0 表示当前没有故障。字段一致性由 Appliance Manager 维护。
@@ -100,5 +106,19 @@ appliance_manager_result_t appliance_manager_reset(
 appliance_manager_result_t appliance_manager_get_model(
     const appliance_manager_t *manager,
     appliance_model_t *output);
+
+/*
+ * 处理 comm_message_manager 已经分类完成的一次事件。
+ *
+ * 当前作为屏端示例，只接受 REPORT_RECEIVED 和 RESPONSE_RECEIVED 中携带的
+ * STATUS_SNAPSHOT。收到完整快照时先解码到局部临时模型，全部字段通过校验后
+ * 才一次性替换当前模型；失败不会留下“前几个字段已更新”的半新半旧状态。
+ *
+ * 模型实际发生变化时同步调用 notify_callback；重复收到内容完全相同的快照
+ * 仍返回 OK，但不重复通知 UI 适配层。
+ */
+appliance_manager_result_t appliance_manager_handle_message_event(
+    appliance_manager_t *manager,
+    const comm_message_event_t *event);
 
 #endif /* APPLIANCE_MANAGER_H */
