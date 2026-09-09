@@ -1,8 +1,20 @@
 #ifndef APPLIANCE_PROTOCOL_H
 #define APPLIANCE_PROTOCOL_H
 
-/* 当前示例定义的业务消息 ID。 */
+/* 当前示例定义的业务消息 ID；请求和对应响应使用不同 ID，避免方向含义混淆。 */
 #define APPLIANCE_MESSAGE_STATUS_SNAPSHOT        0x01u
+#define APPLIANCE_MESSAGE_QUERY_STATUS           0x02u
+
+/*
+ * QUERY_STATUS 不携带查询参数，payload 只有一个业务消息 ID：
+ *
+ *   偏移  大小  含义
+ *   0     1     业务消息 ID，固定为 QUERY_STATUS
+ *
+ * 外层 REQUEST 的 sequence 由 comm_message_manager 分配，不放进业务 payload。
+ */
+#define APPLIANCE_QUERY_STATUS_MESSAGE_ID_OFFSET 0u
+#define APPLIANCE_QUERY_STATUS_PAYLOAD_SIZE      1u
 
 /*
  * STATUS_SNAPSHOT 的 payload 字节布局：
