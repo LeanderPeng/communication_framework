@@ -2,6 +2,14 @@
 
 #include "comm_codec.h"
 
+/* 长期运行计数器使用饱和加一，防止 UINT64_MAX 再加一后悄悄绕回 0。 */
+static void comm_parser_increment_counter(uint64_t *counter)
+{
+    if (*counter != UINT64_MAX) {
+        *counter += 1u;
+    }
+}
+
 /* 从帧头中的两个大端序字节读取负载长度。 */
 static uint16_t comm_parser_read_payload_length(const uint8_t *header)
 {
@@ -11,16 +19,31 @@ static uint16_t comm_parser_read_payload_length(const uint8_t *header)
                           COMM_FRAME_PAYLOAD_LENGTH_OFFSET + 1u]);
 }
 
-/* 将一个已确认无用的字节从输入缓冲区移除。 */
-static int comm_parser_discard_one(comm_ringbuffer_t *ringbuffer)
+/*
+ * 将一个已确认无用的字节从输入缓冲区移除。
+ * stats 为空表示调用方使用兼容的无统计接口；只有实际丢弃成功后才计数。
+ */
+static int comm_parser_discard_one(comm_ringbuffer_t *ringbuffer,
+                                   comm_parser_stats_t *stats)
 {
-    return comm_ringbuffer_discard(ringbuffer, 1u) == COMM_RINGBUFFER_OK;
+    if (comm_ringbuffer_discard(ringbuffer, 1u) != COMM_RINGBUFFER_OK) {
+        return 0;
+    }
+
+    if (stats != NULL) {
+        comm_parser_increment_counter(&stats->discarded_bytes);
+    }
+
+    return 1;
 }
 
-comm_parser_result_t comm_parser_next(comm_ringbuffer_t *ringbuffer,
-                                      uint8_t *scratch,
-                                      size_t scratch_capacity,
-                                      comm_frame_t *frame)
+/* 两个公开入口共享的解析实现；stats 允许为空。 */
+static comm_parser_result_t comm_parser_next_internal(
+    comm_ringbuffer_t *ringbuffer,
+    uint8_t *scratch,
+    size_t scratch_capacity,
+    comm_frame_t *frame,
+    comm_parser_stats_t *stats)
 {
     comm_ringbuffer_result_t ringbuffer_result;
     comm_codec_result_t codec_result;
@@ -61,7 +84,7 @@ comm_parser_result_t comm_parser_next(comm_ringbuffer_t *ringbuffer,
         }
 
         if (scratch[0] != COMM_FRAME_SYNC_BYTE_0) {
-            if (!comm_parser_discard_one(ringbuffer)) {
+            if (!comm_parser_discard_one(ringbuffer, stats)) {
                 return COMM_PARSER_RINGBUFFER_ERROR;
             }
             continue;
@@ -81,7 +104,7 @@ comm_parser_result_t comm_parser_next(comm_ringbuffer_t *ringbuffer,
         }
 
         if (scratch[1] != COMM_FRAME_SYNC_BYTE_1) {
-            if (!comm_parser_discard_one(ringbuffer)) {
+            if (!comm_parser_discard_one(ringbuffer, stats)) {
                 return COMM_PARSER_RINGBUFFER_ERROR;
             }
             continue;
@@ -101,8 +124,12 @@ comm_parser_result_t comm_parser_next(comm_ringbuffer_t *ringbuffer,
 
         payload_length = comm_parser_read_payload_length(scratch);
         if (payload_length > COMM_FRAME_MAX_PAYLOAD_SIZE) {
-            if (!comm_parser_discard_one(ringbuffer)) {
+            if (!comm_parser_discard_one(ringbuffer, stats)) {
                 return COMM_PARSER_RINGBUFFER_ERROR;
+            }
+            if (stats != NULL) {
+                comm_parser_increment_counter(
+                    &stats->oversized_length_candidates);
             }
             continue;
         }
@@ -127,15 +154,70 @@ comm_parser_result_t comm_parser_next(comm_ringbuffer_t *ringbuffer,
             if (ringbuffer_result != COMM_RINGBUFFER_OK) {
                 return COMM_PARSER_RINGBUFFER_ERROR;
             }
+            if (stats != NULL) {
+                comm_parser_increment_counter(&stats->frames_ready);
+            }
             return COMM_PARSER_FRAME_READY;
+        }
+
+        if (stats != NULL) {
+            comm_parser_increment_counter(&stats->decode_errors);
+            if (codec_result == COMM_CODEC_CRC_MISMATCH) {
+                comm_parser_increment_counter(&stats->crc_errors);
+            }
         }
 
         /*
          * 只丢弃候选帧的第一个字节，使候选帧内部可能存在的下一组
          * 同步字节仍有机会被重新识别。
          */
-        if (!comm_parser_discard_one(ringbuffer)) {
+        if (!comm_parser_discard_one(ringbuffer, stats)) {
             return COMM_PARSER_RINGBUFFER_ERROR;
         }
     }
+}
+
+comm_parser_stats_result_t comm_parser_stats_reset(comm_parser_stats_t *stats)
+{
+    if (stats == NULL) {
+        return COMM_PARSER_STATS_NULL_ARGUMENT;
+    }
+
+    stats->frames_ready = 0u;
+    stats->discarded_bytes = 0u;
+    stats->oversized_length_candidates = 0u;
+    stats->decode_errors = 0u;
+    stats->crc_errors = 0u;
+
+    return COMM_PARSER_STATS_OK;
+}
+
+comm_parser_result_t comm_parser_next(comm_ringbuffer_t *ringbuffer,
+                                      uint8_t *scratch,
+                                      size_t scratch_capacity,
+                                      comm_frame_t *frame)
+{
+    return comm_parser_next_internal(ringbuffer,
+                                     scratch,
+                                     scratch_capacity,
+                                     frame,
+                                     NULL);
+}
+
+comm_parser_result_t comm_parser_next_with_stats(
+    comm_ringbuffer_t *ringbuffer,
+    uint8_t *scratch,
+    size_t scratch_capacity,
+    comm_frame_t *frame,
+    comm_parser_stats_t *stats)
+{
+    if (stats == NULL) {
+        return COMM_PARSER_NULL_ARGUMENT;
+    }
+
+    return comm_parser_next_internal(ringbuffer,
+                                     scratch,
+                                     scratch_capacity,
+                                     frame,
+                                     stats);
 }

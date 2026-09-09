@@ -46,6 +46,24 @@ static int make_encoded_frame(uint16_t sequence,
                              encoded_size) == COMM_CODEC_OK ? 0 : 1;
 }
 
+/* 验证统计对象可重复清零，并为 NULL 使用独立、语义明确的结果类型。 */
+static int test_stats_reset(void)
+{
+    comm_parser_stats_t stats;
+
+    memset(&stats, 0xFF, sizeof(stats));
+    TEST_CHECK(comm_parser_stats_reset(NULL) ==
+               COMM_PARSER_STATS_NULL_ARGUMENT);
+    TEST_CHECK(comm_parser_stats_reset(&stats) == COMM_PARSER_STATS_OK);
+    TEST_CHECK(stats.frames_ready == 0u);
+    TEST_CHECK(stats.discarded_bytes == 0u);
+    TEST_CHECK(stats.oversized_length_candidates == 0u);
+    TEST_CHECK(stats.decode_errors == 0u);
+    TEST_CHECK(stats.crc_errors == 0u);
+
+    return 0;
+}
+
 /* 验证空指针、临时空间和 RingBuffer 配置错误。 */
 static int test_invalid_configuration(void)
 {
@@ -54,6 +72,9 @@ static int test_invalid_configuration(void)
     uint8_t storage[TEST_RINGBUFFER_CAPACITY];
     uint8_t small_storage[COMM_FRAME_MAX_ENCODED_SIZE - 1u];
     uint8_t scratch[COMM_FRAME_MAX_ENCODED_SIZE];
+    comm_parser_stats_t stats;
+
+    TEST_CHECK(comm_parser_stats_reset(&stats) == COMM_PARSER_STATS_OK);
 
     TEST_CHECK(comm_ringbuffer_init(&ringbuffer,
                                     storage,
@@ -70,10 +91,24 @@ static int test_invalid_configuration(void)
                                 scratch,
                                 sizeof(scratch),
                                 NULL) == COMM_PARSER_NULL_ARGUMENT);
+    TEST_CHECK(comm_parser_next_with_stats(&ringbuffer,
+                                           scratch,
+                                           sizeof(scratch),
+                                           &frame,
+                                           NULL) ==
+               COMM_PARSER_NULL_ARGUMENT);
     TEST_CHECK(comm_parser_next(&ringbuffer,
                                 scratch,
                                 sizeof(scratch) - 1u,
                                 &frame) == COMM_PARSER_SCRATCH_TOO_SMALL);
+    TEST_CHECK(comm_parser_next_with_stats(&ringbuffer,
+                                           scratch,
+                                           sizeof(scratch) - 1u,
+                                           &frame,
+                                           &stats) ==
+               COMM_PARSER_SCRATCH_TOO_SMALL);
+    TEST_CHECK(stats.frames_ready == 0u);
+    TEST_CHECK(stats.discarded_bytes == 0u);
 
     TEST_CHECK(comm_ringbuffer_init(&ringbuffer,
                                     small_storage,
@@ -305,6 +340,7 @@ static int test_crc_error_resynchronizes(void)
     uint8_t scratch[COMM_FRAME_MAX_ENCODED_SIZE];
     uint8_t bad_encoded[COMM_FRAME_MAX_ENCODED_SIZE];
     uint8_t good_encoded[COMM_FRAME_MAX_ENCODED_SIZE];
+    comm_parser_stats_t stats;
     size_t bad_size = 0u;
     size_t good_size = 0u;
 
@@ -319,6 +355,7 @@ static int test_crc_error_resynchronizes(void)
                                   good_encoded,
                                   &good_size) == 0);
     bad_encoded[COMM_FRAME_PAYLOAD_OFFSET] ^= 0x01u;
+    TEST_CHECK(comm_parser_stats_reset(&stats) == COMM_PARSER_STATS_OK);
 
     TEST_CHECK(comm_ringbuffer_init(&ringbuffer,
                                     storage,
@@ -330,13 +367,20 @@ static int test_crc_error_resynchronizes(void)
                                      good_encoded,
                                      good_size) == COMM_RINGBUFFER_OK);
 
-    TEST_CHECK(comm_parser_next(&ringbuffer,
-                                scratch,
-                                sizeof(scratch),
-                                &frame) == COMM_PARSER_FRAME_READY);
+    TEST_CHECK(comm_parser_next_with_stats(&ringbuffer,
+                                           scratch,
+                                           sizeof(scratch),
+                                           &frame,
+                                           &stats) ==
+               COMM_PARSER_FRAME_READY);
     TEST_CHECK(frame.sequence == 2u);
     TEST_CHECK(memcmp(frame.payload, good_payload, sizeof(good_payload)) == 0);
     TEST_CHECK(comm_ringbuffer_size(&ringbuffer) == 0u);
+    TEST_CHECK(stats.frames_ready == 1u);
+    TEST_CHECK(stats.discarded_bytes == bad_size);
+    TEST_CHECK(stats.oversized_length_candidates == 0u);
+    TEST_CHECK(stats.decode_errors == 1u);
+    TEST_CHECK(stats.crc_errors == 1u);
 
     return 0;
 }
@@ -354,6 +398,7 @@ static int test_invalid_length_resynchronizes(void)
     uint8_t storage[TEST_RINGBUFFER_CAPACITY];
     uint8_t scratch[COMM_FRAME_MAX_ENCODED_SIZE];
     uint8_t encoded[COMM_FRAME_MAX_ENCODED_SIZE];
+    comm_parser_stats_t stats;
     size_t encoded_size = 0u;
 
     TEST_CHECK(make_encoded_frame(9u,
@@ -361,6 +406,7 @@ static int test_invalid_length_resynchronizes(void)
                                   sizeof(payload),
                                   encoded,
                                   &encoded_size) == 0);
+    TEST_CHECK(comm_parser_stats_reset(&stats) == COMM_PARSER_STATS_OK);
     TEST_CHECK(comm_ringbuffer_init(&ringbuffer,
                                     storage,
                                     sizeof(storage)) == COMM_RINGBUFFER_OK);
@@ -372,18 +418,70 @@ static int test_invalid_length_resynchronizes(void)
                                      encoded,
                                      encoded_size) == COMM_RINGBUFFER_OK);
 
-    TEST_CHECK(comm_parser_next(&ringbuffer,
-                                scratch,
-                                sizeof(scratch),
-                                &frame) == COMM_PARSER_FRAME_READY);
+    TEST_CHECK(comm_parser_next_with_stats(&ringbuffer,
+                                           scratch,
+                                           sizeof(scratch),
+                                           &frame,
+                                           &stats) ==
+               COMM_PARSER_FRAME_READY);
     TEST_CHECK(frame.sequence == 9u);
     TEST_CHECK(comm_ringbuffer_size(&ringbuffer) == 0u);
+    TEST_CHECK(stats.frames_ready == 1u);
+    TEST_CHECK(stats.discarded_bytes == sizeof(invalid_header));
+    TEST_CHECK(stats.oversized_length_candidates == 1u);
+    TEST_CHECK(stats.decode_errors == 0u);
+    TEST_CHECK(stats.crc_errors == 0u);
+
+    return 0;
+}
+
+/* 验证长期运行计数器达到 UINT64_MAX 后保持饱和，不会绕回 0。 */
+static int test_stats_saturate(void)
+{
+    static const uint8_t garbage = 0x13u;
+    comm_ringbuffer_t ringbuffer;
+    comm_frame_t frame;
+    comm_parser_stats_t stats;
+    uint8_t storage[TEST_RINGBUFFER_CAPACITY];
+    uint8_t scratch[COMM_FRAME_MAX_ENCODED_SIZE];
+    uint8_t encoded[COMM_FRAME_MAX_ENCODED_SIZE];
+    size_t encoded_size = 0u;
+
+    TEST_CHECK(make_encoded_frame(10u,
+                                  NULL,
+                                  0u,
+                                  encoded,
+                                  &encoded_size) == 0);
+    TEST_CHECK(comm_parser_stats_reset(&stats) == COMM_PARSER_STATS_OK);
+    stats.frames_ready = UINT64_MAX;
+    stats.discarded_bytes = UINT64_MAX;
+
+    TEST_CHECK(comm_ringbuffer_init(&ringbuffer,
+                                    storage,
+                                    sizeof(storage)) == COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_ringbuffer_write(&ringbuffer, &garbage, 1u) ==
+               COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_ringbuffer_write(&ringbuffer,
+                                     encoded,
+                                     encoded_size) == COMM_RINGBUFFER_OK);
+    TEST_CHECK(comm_parser_next_with_stats(&ringbuffer,
+                                           scratch,
+                                           sizeof(scratch),
+                                           &frame,
+                                           &stats) ==
+               COMM_PARSER_FRAME_READY);
+    TEST_CHECK(frame.sequence == 10u);
+    TEST_CHECK(stats.frames_ready == UINT64_MAX);
+    TEST_CHECK(stats.discarded_bytes == UINT64_MAX);
 
     return 0;
 }
 
 int main(void)
 {
+    if (test_stats_reset() != 0) {
+        return 1;
+    }
     if (test_invalid_configuration() != 0) {
         return 1;
     }
@@ -403,6 +501,9 @@ int main(void)
         return 1;
     }
     if (test_invalid_length_resynchronizes() != 0) {
+        return 1;
+    }
+    if (test_stats_saturate() != 0) {
         return 1;
     }
 
