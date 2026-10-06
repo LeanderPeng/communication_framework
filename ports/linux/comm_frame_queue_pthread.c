@@ -7,6 +7,24 @@
 #include <errno.h>
 #include <time.h>
 
+/* 所有运行期计数都在 mutex 内完成，饱和后仍继续执行正常队列操作。 */
+static void comm_frame_queue_pthread_increment_counter(uint64_t *counter)
+{
+    if (*counter != UINT64_MAX) {
+        *counter += 1u;
+    }
+}
+
+static void comm_frame_queue_pthread_clear_stats(
+    comm_frame_queue_pthread_stats_t *stats,
+    size_t current_size)
+{
+    comm_frame_queue_pthread_stats_t empty = {0};
+
+    empty.peak_size = current_size;
+    *stats = empty;
+}
+
 /* 将对象恢复为不持有任何可用资源的状态。 */
 static void comm_frame_queue_pthread_mark_uninitialized(
     comm_frame_queue_pthread_t *queue)
@@ -18,6 +36,7 @@ static void comm_frame_queue_pthread_mark_uninitialized(
     queue->core.used = 0u;
     queue->initialized = 0;
     queue->closed = 0;
+    queue->stats = NULL;
 }
 
 /*
@@ -84,10 +103,11 @@ static int comm_frame_queue_pthread_make_deadline(
     return 1;
 }
 
-comm_frame_queue_pthread_result_t comm_frame_queue_pthread_init(
+static comm_frame_queue_pthread_result_t comm_frame_queue_pthread_init_internal(
     comm_frame_queue_pthread_t *queue,
     comm_frame_t *storage,
-    size_t capacity)
+    size_t capacity,
+    comm_frame_queue_pthread_stats_t *stats_storage)
 {
     pthread_condattr_t condition_attribute;
 
@@ -147,10 +167,87 @@ comm_frame_queue_pthread_result_t comm_frame_queue_pthread_init(
         return COMM_FRAME_QUEUE_PTHREAD_SYSTEM_ERROR;
     }
 
+    if (stats_storage != NULL) {
+        comm_frame_queue_pthread_clear_stats(stats_storage, 0u);
+    }
+    queue->stats = stats_storage;
     queue->initialized = 1;
     queue->closed = 0;
 
     return COMM_FRAME_QUEUE_PTHREAD_OK;
+}
+
+comm_frame_queue_pthread_result_t comm_frame_queue_pthread_init(
+    comm_frame_queue_pthread_t *queue,
+    comm_frame_t *storage,
+    size_t capacity)
+{
+    return comm_frame_queue_pthread_init_internal(queue, storage, capacity, NULL);
+}
+
+comm_frame_queue_pthread_result_t comm_frame_queue_pthread_init_with_stats(
+    comm_frame_queue_pthread_t *queue,
+    comm_frame_t *storage,
+    size_t capacity,
+    comm_frame_queue_pthread_stats_t *stats_storage)
+{
+    if (stats_storage == NULL) {
+        return COMM_FRAME_QUEUE_PTHREAD_NULL_ARGUMENT;
+    }
+    return comm_frame_queue_pthread_init_internal(queue, storage, capacity,
+                                                 stats_storage);
+}
+
+comm_frame_queue_pthread_result_t comm_frame_queue_pthread_get_stats(
+    comm_frame_queue_pthread_t *queue,
+    comm_frame_queue_pthread_stats_t *output)
+{
+    comm_frame_queue_pthread_stats_t snapshot;
+    comm_frame_queue_pthread_result_t result;
+
+    if ((queue == NULL) || (output == NULL)) {
+        return COMM_FRAME_QUEUE_PTHREAD_NULL_ARGUMENT;
+    }
+    if (queue->initialized != 1) {
+        return COMM_FRAME_QUEUE_PTHREAD_INVALID_STATE;
+    }
+    if (pthread_mutex_lock(&queue->mutex) != 0) {
+        return COMM_FRAME_QUEUE_PTHREAD_SYSTEM_ERROR;
+    }
+    if ((queue->stats == NULL) || !comm_frame_queue_pthread_core_is_valid(queue)) {
+        return comm_frame_queue_pthread_unlock_and_return(
+            queue, COMM_FRAME_QUEUE_PTHREAD_INVALID_STATE);
+    }
+
+    snapshot = *queue->stats;
+    result = comm_frame_queue_pthread_unlock_and_return(
+        queue, COMM_FRAME_QUEUE_PTHREAD_OK);
+    if (result == COMM_FRAME_QUEUE_PTHREAD_OK) {
+        *output = snapshot;
+    }
+    return result;
+}
+
+comm_frame_queue_pthread_result_t comm_frame_queue_pthread_reset_stats(
+    comm_frame_queue_pthread_t *queue)
+{
+    if (queue == NULL) {
+        return COMM_FRAME_QUEUE_PTHREAD_NULL_ARGUMENT;
+    }
+    if (queue->initialized != 1) {
+        return COMM_FRAME_QUEUE_PTHREAD_INVALID_STATE;
+    }
+    if (pthread_mutex_lock(&queue->mutex) != 0) {
+        return COMM_FRAME_QUEUE_PTHREAD_SYSTEM_ERROR;
+    }
+    if ((queue->stats == NULL) || !comm_frame_queue_pthread_core_is_valid(queue)) {
+        return comm_frame_queue_pthread_unlock_and_return(
+            queue, COMM_FRAME_QUEUE_PTHREAD_INVALID_STATE);
+    }
+
+    comm_frame_queue_pthread_clear_stats(queue->stats, queue->core.used);
+    return comm_frame_queue_pthread_unlock_and_return(
+        queue, COMM_FRAME_QUEUE_PTHREAD_OK);
 }
 
 comm_frame_queue_pthread_result_t comm_frame_queue_pthread_close(
@@ -251,6 +348,17 @@ comm_frame_queue_pthread_result_t comm_frame_queue_pthread_push(
             COMM_FRAME_QUEUE_PTHREAD_INVALID_STATE);
     }
 
+    /* 在进入循环前记录一次，反复被唤醒不会重复累计同一次调用。 */
+    if ((queue->stats != NULL) && (queue->closed == 0) &&
+        (queue->core.used == queue->core.capacity)) {
+        comm_frame_queue_pthread_increment_counter(
+            &queue->stats->push_full_encounters);
+        if (timeout_ms != 0u) {
+            comm_frame_queue_pthread_increment_counter(
+                &queue->stats->push_wait_count);
+        }
+    }
+
     /*
      * 必须使用 while，不能使用 if：条件变量允许虚假唤醒；即使确实由一次
      * 出队唤醒，多个生产者也可能竞争同一个空槽位。线程重新获得 mutex
@@ -259,6 +367,10 @@ comm_frame_queue_pthread_result_t comm_frame_queue_pthread_push(
     while ((queue->closed == 0) &&
            (queue->core.used == queue->core.capacity)) {
         if (timeout_ms == 0u) {
+            if (queue->stats != NULL) {
+                comm_frame_queue_pthread_increment_counter(
+                    &queue->stats->push_timeout_count);
+            }
             return comm_frame_queue_pthread_unlock_and_return(
                 queue,
                 COMM_FRAME_QUEUE_PTHREAD_TIMEOUT);
@@ -284,6 +396,10 @@ comm_frame_queue_pthread_result_t comm_frame_queue_pthread_push(
                     COMM_FRAME_QUEUE_PTHREAD_CLOSED);
             }
 
+            if (queue->stats != NULL) {
+                comm_frame_queue_pthread_increment_counter(
+                    &queue->stats->push_timeout_count);
+            }
             return comm_frame_queue_pthread_unlock_and_return(
                 queue,
                 COMM_FRAME_QUEUE_PTHREAD_TIMEOUT);
@@ -314,6 +430,13 @@ comm_frame_queue_pthread_result_t comm_frame_queue_pthread_push(
         return comm_frame_queue_pthread_unlock_and_return(
             queue,
             COMM_FRAME_QUEUE_PTHREAD_INVALID_STATE);
+    }
+
+    if (queue->stats != NULL) {
+        comm_frame_queue_pthread_increment_counter(&queue->stats->frames_pushed);
+        if (queue->core.used > queue->stats->peak_size) {
+            queue->stats->peak_size = queue->core.used;
+        }
     }
 
     /*
@@ -371,6 +494,16 @@ comm_frame_queue_pthread_result_t comm_frame_queue_pthread_pop(
             COMM_FRAME_QUEUE_PTHREAD_INVALID_STATE);
     }
 
+    if ((queue->stats != NULL) && (queue->closed == 0) &&
+        (queue->core.used == 0u)) {
+        comm_frame_queue_pthread_increment_counter(
+            &queue->stats->pop_empty_encounters);
+        if (timeout_ms != 0u) {
+            comm_frame_queue_pthread_increment_counter(
+                &queue->stats->pop_wait_count);
+        }
+    }
+
     /*
      * 消费者只在“队列为空且尚未关闭”时等待。这里同样必须使用 while：
      * 条件变量可能虚假唤醒；多个消费者也可能同时被唤醒并竞争同一帧，
@@ -378,6 +511,10 @@ comm_frame_queue_pthread_result_t comm_frame_queue_pthread_pop(
      */
     while ((queue->closed == 0) && (queue->core.used == 0u)) {
         if (timeout_ms == 0u) {
+            if (queue->stats != NULL) {
+                comm_frame_queue_pthread_increment_counter(
+                    &queue->stats->pop_timeout_count);
+            }
             return comm_frame_queue_pthread_unlock_and_return(
                 queue,
                 COMM_FRAME_QUEUE_PTHREAD_TIMEOUT);
@@ -400,6 +537,10 @@ comm_frame_queue_pthread_result_t comm_frame_queue_pthread_pop(
                     COMM_FRAME_QUEUE_PTHREAD_CLOSED);
             }
 
+            if (queue->stats != NULL) {
+                comm_frame_queue_pthread_increment_counter(
+                    &queue->stats->pop_timeout_count);
+            }
             return comm_frame_queue_pthread_unlock_and_return(
                 queue,
                 COMM_FRAME_QUEUE_PTHREAD_TIMEOUT);
@@ -433,6 +574,10 @@ comm_frame_queue_pthread_result_t comm_frame_queue_pthread_pop(
         return comm_frame_queue_pthread_unlock_and_return(
             queue,
             COMM_FRAME_QUEUE_PTHREAD_INVALID_STATE);
+    }
+
+    if (queue->stats != NULL) {
+        comm_frame_queue_pthread_increment_counter(&queue->stats->frames_popped);
     }
 
     /*
