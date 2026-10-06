@@ -38,6 +38,38 @@ typedef struct {
 } comm_frame_queue_t;
 
 /*
+ * 核心帧队列的可选诊断统计，由调用方持有，不增加 queue 对象的内存占用。
+ *
+ * frames_pushed   成功复制进队列的帧数。
+ * frames_popped   成功从队列取出的帧数；reset 清空队列不算出队。
+ * push_full_count 有效 push 因队列已满而返回 FULL 的次数，不等于丢帧数，
+ *                 调用方稍后可能再次投递同一帧。
+ * peak_size       统计期间观察到的最大积压帧数，单位是帧槽位，不是字节。
+ *
+ * 三个累计计数器到达 UINT64_MAX 后保持饱和。首次使用应调用 stats_reset，
+ * 从当前队列深度开始统计。一个统计对象应始终对应同一个队列，并在该统计
+ * 周期内对全部 push/pop 使用带统计接口；混用原接口会漏记操作和峰值。
+ *
+ * stats 不得与 queue、storage 或输入/输出帧重叠。统计本身不加锁，跨任务
+ * 读写时必须和队列使用相同的外部同步机制；不能无锁读取正在更新的计数器。
+ */
+typedef struct {
+    uint64_t frames_pushed;
+    uint64_t frames_popped;
+    uint64_t push_full_count;
+    size_t peak_size;
+} comm_frame_queue_stats_t;
+
+/*
+ * 开始一个新的统计周期：累计计数清零，peak_size 设为 queue 当前帧数。
+ * 不移除已有帧，不修改队列。参数或队列状态无效时不修改 stats。
+ * comm_frame_queue_reset 只清空队列，不会自动清除这个外部统计对象。
+ */
+comm_frame_queue_result_t comm_frame_queue_stats_reset(
+    const comm_frame_queue_t *queue,
+    comm_frame_queue_stats_t *stats);
+
+/*
  * 使用调用方提供的固定帧数组初始化队列。
  * storage 不能为空且 capacity 必须大于 0；失败时不修改 queue。
  */
@@ -69,5 +101,24 @@ comm_frame_queue_result_t comm_frame_queue_push(comm_frame_queue_t *queue,
  */
 comm_frame_queue_result_t comm_frame_queue_pop(comm_frame_queue_t *queue,
                                                comm_frame_t *frame);
+
+/*
+ * 与原 push/pop 共用实现并保持相同的帧复制、FIFO 和满/空返回语义。
+ * stats 必须非空且已初始化；参数或队列状态错误不修改统计。
+ * push 成功时更新入队数和峰值；FULL 只增加满队列拒绝次数。
+ * pop 成功时增加出队数；EMPTY 不增加计数。有效操作也会观察操作前深度。
+ *
+ * 这里统计的是非阻塞核心操作。pthread 包装层会先等待，再调用核心队列，
+ * 因此核心 FULL 次数不能替代 pthread 的遇满、等待或最终超时次数。
+ */
+comm_frame_queue_result_t comm_frame_queue_push_with_stats(
+    comm_frame_queue_t *queue,
+    const comm_frame_t *frame,
+    comm_frame_queue_stats_t *stats);
+
+comm_frame_queue_result_t comm_frame_queue_pop_with_stats(
+    comm_frame_queue_t *queue,
+    comm_frame_t *frame,
+    comm_frame_queue_stats_t *stats);
 
 #endif /* COMM_FRAME_QUEUE_H */

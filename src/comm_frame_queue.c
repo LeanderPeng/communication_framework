@@ -1,5 +1,22 @@
 #include "comm_frame_queue.h"
 
+/* 与 Parser 一样使用饱和计数，避免长期运行后累计值绕回零。 */
+static void comm_frame_queue_increment_counter(uint64_t *counter)
+{
+    if (*counter != UINT64_MAX) {
+        *counter += 1u;
+    }
+}
+
+/* 只观察当前积压量；一次出队不能让历史峰值下降。 */
+static void comm_frame_queue_observe_size(comm_frame_queue_stats_t *stats,
+                                          size_t used)
+{
+    if ((stats != NULL) && (used > stats->peak_size)) {
+        stats->peak_size = used;
+    }
+}
+
 /* 判断帧队列是否仍持有可用的底层存储配置。 */
 static int comm_frame_queue_has_storage(const comm_frame_queue_t *queue)
 {
@@ -102,8 +119,31 @@ size_t comm_frame_queue_free_space(const comm_frame_queue_t *queue)
     return queue->capacity - queue->used;
 }
 
-comm_frame_queue_result_t comm_frame_queue_push(comm_frame_queue_t *queue,
-                                                const comm_frame_t *frame)
+comm_frame_queue_result_t comm_frame_queue_stats_reset(
+    const comm_frame_queue_t *queue,
+    comm_frame_queue_stats_t *stats)
+{
+    if ((queue == NULL) || (stats == NULL)) {
+        return COMM_FRAME_QUEUE_NULL_ARGUMENT;
+    }
+
+    if (!comm_frame_queue_state_is_valid(queue)) {
+        return COMM_FRAME_QUEUE_INVALID_STATE;
+    }
+
+    stats->frames_pushed = 0u;
+    stats->frames_popped = 0u;
+    stats->push_full_count = 0u;
+    stats->peak_size = queue->used;
+
+    return COMM_FRAME_QUEUE_OK;
+}
+
+/* 原接口与带统计接口共享所有校验和队列操作；NULL 表示不记录统计。 */
+static comm_frame_queue_result_t comm_frame_queue_push_internal(
+    comm_frame_queue_t *queue,
+    const comm_frame_t *frame,
+    comm_frame_queue_stats_t *stats)
 {
     if (queue == NULL) {
         return COMM_FRAME_QUEUE_NULL_ARGUMENT;
@@ -117,7 +157,11 @@ comm_frame_queue_result_t comm_frame_queue_push(comm_frame_queue_t *queue,
         return COMM_FRAME_QUEUE_NULL_ARGUMENT;
     }
 
+    comm_frame_queue_observe_size(stats, queue->used);
     if (queue->used == queue->capacity) {
+        if (stats != NULL) {
+            comm_frame_queue_increment_counter(&stats->push_full_count);
+        }
         return COMM_FRAME_QUEUE_FULL;
     }
 
@@ -128,11 +172,18 @@ comm_frame_queue_result_t comm_frame_queue_push(comm_frame_queue_t *queue,
         queue->capacity);
     queue->used += 1u;
 
+    if (stats != NULL) {
+        comm_frame_queue_increment_counter(&stats->frames_pushed);
+        comm_frame_queue_observe_size(stats, queue->used);
+    }
+
     return COMM_FRAME_QUEUE_OK;
 }
 
-comm_frame_queue_result_t comm_frame_queue_pop(comm_frame_queue_t *queue,
-                                               comm_frame_t *frame)
+static comm_frame_queue_result_t comm_frame_queue_pop_internal(
+    comm_frame_queue_t *queue,
+    comm_frame_t *frame,
+    comm_frame_queue_stats_t *stats)
 {
     if (queue == NULL) {
         return COMM_FRAME_QUEUE_NULL_ARGUMENT;
@@ -146,6 +197,7 @@ comm_frame_queue_result_t comm_frame_queue_pop(comm_frame_queue_t *queue,
         return COMM_FRAME_QUEUE_NULL_ARGUMENT;
     }
 
+    comm_frame_queue_observe_size(stats, queue->used);
     if (queue->used == 0u) {
         return COMM_FRAME_QUEUE_EMPTY;
     }
@@ -157,5 +209,45 @@ comm_frame_queue_result_t comm_frame_queue_pop(comm_frame_queue_t *queue,
         queue->capacity);
     queue->used -= 1u;
 
+    if (stats != NULL) {
+        comm_frame_queue_increment_counter(&stats->frames_popped);
+    }
+
     return COMM_FRAME_QUEUE_OK;
+}
+
+comm_frame_queue_result_t comm_frame_queue_push(comm_frame_queue_t *queue,
+                                                const comm_frame_t *frame)
+{
+    return comm_frame_queue_push_internal(queue, frame, NULL);
+}
+
+comm_frame_queue_result_t comm_frame_queue_pop(comm_frame_queue_t *queue,
+                                               comm_frame_t *frame)
+{
+    return comm_frame_queue_pop_internal(queue, frame, NULL);
+}
+
+comm_frame_queue_result_t comm_frame_queue_push_with_stats(
+    comm_frame_queue_t *queue,
+    const comm_frame_t *frame,
+    comm_frame_queue_stats_t *stats)
+{
+    if (stats == NULL) {
+        return COMM_FRAME_QUEUE_NULL_ARGUMENT;
+    }
+
+    return comm_frame_queue_push_internal(queue, frame, stats);
+}
+
+comm_frame_queue_result_t comm_frame_queue_pop_with_stats(
+    comm_frame_queue_t *queue,
+    comm_frame_t *frame,
+    comm_frame_queue_stats_t *stats)
+{
+    if (stats == NULL) {
+        return COMM_FRAME_QUEUE_NULL_ARGUMENT;
+    }
+
+    return comm_frame_queue_pop_internal(queue, frame, stats);
 }

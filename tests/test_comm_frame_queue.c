@@ -424,8 +424,210 @@ static int test_pop_rejects_invalid_request(void)
     return 0;
 }
 
+static int stats_are_equal(const comm_frame_queue_stats_t *left,
+                            const comm_frame_queue_stats_t *right)
+{
+    return (left->frames_pushed == right->frames_pushed) &&
+           (left->frames_popped == right->frames_popped) &&
+           (left->push_full_count == right->push_full_count) &&
+           (left->peak_size == right->peak_size);
+}
+
+/* 满队列拒绝不等于丢帧；消费后可以再次投递，并且仍然保持复制和 FIFO。 */
+static int test_stats_fifo_and_full_retries(void)
+{
+    comm_frame_queue_t queue;
+    comm_frame_t storage[2];
+    comm_frame_t first;
+    comm_frame_t second;
+    comm_frame_t third;
+    comm_frame_t output;
+    comm_frame_t expected_output;
+    comm_frame_queue_stats_t stats;
+    comm_frame_queue_stats_t expected_stats;
+
+    fill_frame(&first, 1u, 0x11u);
+    fill_frame(&second, 2u, 0x22u);
+    fill_frame(&third, 3u, 0x33u);
+    TEST_CHECK(comm_frame_queue_init(&queue, storage, 2u) == COMM_FRAME_QUEUE_OK);
+    TEST_CHECK(comm_frame_queue_stats_reset(&queue, &stats) == COMM_FRAME_QUEUE_OK);
+    TEST_CHECK(stats.frames_pushed == 0u && stats.frames_popped == 0u);
+    TEST_CHECK(stats.push_full_count == 0u && stats.peak_size == 0u);
+
+    TEST_CHECK(comm_frame_queue_push_with_stats(&queue, &first, &stats) ==
+               COMM_FRAME_QUEUE_OK);
+    TEST_CHECK(stats.frames_pushed == 1u && stats.peak_size == 1u);
+    TEST_CHECK(comm_frame_queue_push_with_stats(&queue, &second, &stats) ==
+               COMM_FRAME_QUEUE_OK);
+    TEST_CHECK(comm_frame_queue_push_with_stats(&queue, &third, &stats) ==
+               COMM_FRAME_QUEUE_FULL);
+    TEST_CHECK(comm_frame_queue_push_with_stats(&queue, &third, &stats) ==
+               COMM_FRAME_QUEUE_FULL);
+    TEST_CHECK(stats.frames_pushed == 2u && stats.frames_popped == 0u);
+    TEST_CHECK(stats.push_full_count == 2u && stats.peak_size == 2u);
+    TEST_CHECK(queue.used == 2u);
+
+    TEST_CHECK(comm_frame_queue_pop_with_stats(&queue, &output, &stats) ==
+               COMM_FRAME_QUEUE_OK);
+    TEST_CHECK(frames_are_equal(&output, &first));
+    TEST_CHECK(stats.frames_popped == 1u && stats.peak_size == 2u);
+    TEST_CHECK(comm_frame_queue_push_with_stats(&queue, &third, &stats) ==
+               COMM_FRAME_QUEUE_OK);
+    expected_output = third;
+    fill_frame(&third, 99u, 0x99u);
+    TEST_CHECK(comm_frame_queue_pop_with_stats(&queue, &output, &stats) ==
+               COMM_FRAME_QUEUE_OK);
+    TEST_CHECK(frames_are_equal(&output, &second));
+    TEST_CHECK(comm_frame_queue_pop_with_stats(&queue, &output, &stats) ==
+               COMM_FRAME_QUEUE_OK);
+    TEST_CHECK(frames_are_equal(&output, &expected_output));
+    TEST_CHECK(stats.frames_pushed == 3u && stats.frames_popped == 3u);
+    TEST_CHECK(stats.push_full_count == 2u && stats.peak_size == 2u);
+
+    expected_stats = stats;
+    TEST_CHECK(comm_frame_queue_pop_with_stats(&queue, &output, &stats) ==
+               COMM_FRAME_QUEUE_EMPTY);
+    TEST_CHECK(frames_are_equal(&output, &expected_output));
+    TEST_CHECK(stats_are_equal(&stats, &expected_stats));
+    TEST_CHECK(queue.used == 0u);
+    return 0;
+}
+
+/* 在非空队列开始统计时，以当前深度作为峰值；清统计和清队列是独立操作。 */
+static int test_stats_reset_preserves_queued_frames(void)
+{
+    comm_frame_queue_t queue;
+    comm_frame_t storage[2];
+    comm_frame_t input;
+    comm_frame_t output;
+    comm_frame_queue_stats_t stats;
+    comm_frame_queue_stats_t expected;
+
+    fill_frame(&input, 7u, 0x77u);
+    TEST_CHECK(comm_frame_queue_init(&queue, storage, 2u) == COMM_FRAME_QUEUE_OK);
+    TEST_CHECK(comm_frame_queue_push(&queue, &input) == COMM_FRAME_QUEUE_OK);
+    TEST_CHECK(comm_frame_queue_push(&queue, &input) == COMM_FRAME_QUEUE_OK);
+    TEST_CHECK(comm_frame_queue_stats_reset(&queue, &stats) == COMM_FRAME_QUEUE_OK);
+    TEST_CHECK(stats.frames_pushed == 0u && stats.frames_popped == 0u);
+    TEST_CHECK(stats.push_full_count == 0u && stats.peak_size == 2u);
+    TEST_CHECK(queue.used == 2u && queue.read_index == 0u && queue.write_index == 0u);
+    TEST_CHECK(comm_frame_queue_pop_with_stats(&queue, &output, &stats) ==
+               COMM_FRAME_QUEUE_OK);
+    TEST_CHECK(frames_are_equal(&output, &input));
+    TEST_CHECK(stats.frames_popped == 1u && stats.peak_size == 2u);
+
+    TEST_CHECK(comm_frame_queue_stats_reset(&queue, &stats) == COMM_FRAME_QUEUE_OK);
+    TEST_CHECK(stats.frames_pushed == 0u && stats.frames_popped == 0u);
+    TEST_CHECK(stats.push_full_count == 0u && stats.peak_size == 1u);
+    TEST_CHECK(queue.used == 1u && queue.read_index == 1u && queue.write_index == 0u);
+    TEST_CHECK(frames_are_equal(&storage[1], &input));
+    expected = stats;
+    TEST_CHECK(comm_frame_queue_reset(&queue) == COMM_FRAME_QUEUE_OK);
+    TEST_CHECK(queue.used == 0u);
+    TEST_CHECK(stats_are_equal(&stats, &expected));
+    TEST_CHECK(comm_frame_queue_stats_reset(&queue, &stats) == COMM_FRAME_QUEUE_OK);
+    TEST_CHECK(stats.peak_size == 0u);
+    return 0;
+}
+
+/* 参数和状态错误不得留下统计、输出帧或队列的半更新。 */
+static int test_stats_validation_is_transactional(void)
+{
+    comm_frame_queue_t queue;
+    comm_frame_t storage[2];
+    comm_frame_t input;
+    comm_frame_t output;
+    comm_frame_t expected_output;
+    comm_frame_queue_stats_t stats = {11u, 12u, 13u, 0u};
+    comm_frame_queue_stats_t expected = stats;
+
+    fill_frame(&input, 1u, 0x11u);
+    fill_frame(&output, 9u, 0x99u);
+    expected_output = output;
+    TEST_CHECK(comm_frame_queue_init(&queue, storage, 2u) == COMM_FRAME_QUEUE_OK);
+    TEST_CHECK(comm_frame_queue_push(&queue, &input) == COMM_FRAME_QUEUE_OK);
+
+    TEST_CHECK(comm_frame_queue_stats_reset(NULL, &stats) ==
+               COMM_FRAME_QUEUE_NULL_ARGUMENT);
+    TEST_CHECK(comm_frame_queue_stats_reset(&queue, NULL) ==
+               COMM_FRAME_QUEUE_NULL_ARGUMENT);
+    TEST_CHECK(comm_frame_queue_push_with_stats(NULL, &input, &stats) ==
+               COMM_FRAME_QUEUE_NULL_ARGUMENT);
+    TEST_CHECK(comm_frame_queue_pop_with_stats(NULL, &output, &stats) ==
+               COMM_FRAME_QUEUE_NULL_ARGUMENT);
+    TEST_CHECK(comm_frame_queue_push_with_stats(&queue, NULL, &stats) ==
+               COMM_FRAME_QUEUE_NULL_ARGUMENT);
+    TEST_CHECK(comm_frame_queue_pop_with_stats(&queue, NULL, &stats) ==
+               COMM_FRAME_QUEUE_NULL_ARGUMENT);
+    TEST_CHECK(comm_frame_queue_push_with_stats(&queue, &input, NULL) ==
+               COMM_FRAME_QUEUE_NULL_ARGUMENT);
+    TEST_CHECK(comm_frame_queue_pop_with_stats(&queue, &output, NULL) ==
+               COMM_FRAME_QUEUE_NULL_ARGUMENT);
+    TEST_CHECK(stats_are_equal(&stats, &expected));
+    TEST_CHECK(queue.used == 1u && queue.read_index == 0u && queue.write_index == 1u);
+
+    queue.write_index = queue.capacity;
+    TEST_CHECK(comm_frame_queue_stats_reset(&queue, &stats) ==
+               COMM_FRAME_QUEUE_INVALID_STATE);
+    TEST_CHECK(comm_frame_queue_push_with_stats(&queue, &input, &stats) ==
+               COMM_FRAME_QUEUE_INVALID_STATE);
+    TEST_CHECK(comm_frame_queue_pop_with_stats(&queue, &output, &stats) ==
+               COMM_FRAME_QUEUE_INVALID_STATE);
+    TEST_CHECK(stats_are_equal(&stats, &expected));
+    TEST_CHECK(frames_are_equal(&output, &expected_output));
+    TEST_CHECK(frames_are_equal(&storage[0], &input));
+    TEST_CHECK(queue.used == 1u && queue.read_index == 0u);
+    TEST_CHECK(queue.write_index == queue.capacity);
+    return 0;
+}
+
+/* 三项累计值分别在边界饱和，同时队列仍可正常入队、拒绝、出队。 */
+static int test_stats_counters_saturate(void)
+{
+    comm_frame_queue_t queue;
+    comm_frame_t storage[1];
+    comm_frame_t input;
+    comm_frame_t output;
+    comm_frame_queue_stats_t stats;
+    size_t index;
+
+    fill_frame(&input, 1u, 0x11u);
+    TEST_CHECK(comm_frame_queue_init(&queue, storage, 1u) == COMM_FRAME_QUEUE_OK);
+    TEST_CHECK(comm_frame_queue_stats_reset(&queue, &stats) == COMM_FRAME_QUEUE_OK);
+    stats.frames_pushed = UINT64_MAX - 1u;
+    stats.frames_popped = UINT64_MAX - 1u;
+    stats.push_full_count = UINT64_MAX - 1u;
+
+    for (index = 0u; index < 3u; ++index) {
+        TEST_CHECK(comm_frame_queue_push_with_stats(&queue, &input, &stats) ==
+                   COMM_FRAME_QUEUE_OK);
+        TEST_CHECK(comm_frame_queue_push_with_stats(&queue, &input, &stats) ==
+                   COMM_FRAME_QUEUE_FULL);
+        TEST_CHECK(comm_frame_queue_pop_with_stats(&queue, &output, &stats) ==
+                   COMM_FRAME_QUEUE_OK);
+        TEST_CHECK(frames_are_equal(&output, &input));
+        TEST_CHECK(stats.frames_pushed == UINT64_MAX);
+        TEST_CHECK(stats.frames_popped == UINT64_MAX);
+        TEST_CHECK(stats.push_full_count == UINT64_MAX);
+        TEST_CHECK(stats.peak_size == 1u);
+    }
+    return 0;
+}
+
 int main(void)
 {
+    if (test_stats_fifo_and_full_retries() != 0) {
+        return 1;
+    }
+    if (test_stats_reset_preserves_queued_frames() != 0) {
+        return 1;
+    }
+    if (test_stats_validation_is_transactional() != 0) {
+        return 1;
+    }
+    if (test_stats_counters_saturate() != 0) {
+        return 1;
+    }
     if (test_init_validation() != 0) {
         return 1;
     }
