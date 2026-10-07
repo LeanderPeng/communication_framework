@@ -91,6 +91,40 @@ typedef struct {
 } comm_message_manager_config_t;
 
 /*
+ * 可选事务诊断，所有 uint64_t 计数均饱和递增，不会绕回零。
+ *
+ * frames_sent：通道返回 OK 的总帧数，包括初次请求、重发及 RESPONSE/REPORT/ERROR。
+ * requests_sent：初次请求成功投递并建立 pending 的次数，不包含重发。
+ * send_failures：实际调用通道后得到非 OK 的次数，包含初次、重发和非请求发送；
+ *               参数错误、pending 满等未调用通道的拒绝不计入。
+ * requests_received / reports_received：已分发的对端请求/主动上报。
+ * responses_matched / errors_matched：按 sequence 匹配并结束 pending 的回复。
+ * unmatched_replies：找不到活动 pending 的 RESPONSE/ERROR，不重复计入匹配数。
+ * retries_sent：通道接受的重发次数，是 frames_sent 的子集。
+ * request_timeouts：用尽重试次数后结束 pending 的最终超时次数。
+ * pending_full_count：新请求因 pending 无空位被拒绝的次数。
+ * pending_peak：本统计周期内同时活动的 pending 数量峰值。
+ *
+ * 发送成功只表示通道接受，不证明 UART 已发完或设备已执行。回复匹配不证明
+ * 业务 payload 合法；CRC 错误由 Parser 统计，不在此层重复统计。
+ * 接收/超时计数在 pending 状态处理完成后、同步事件回调之前更新。
+ */
+typedef struct {
+    uint64_t frames_sent;
+    uint64_t requests_sent;
+    uint64_t send_failures;
+    uint64_t requests_received;
+    uint64_t reports_received;
+    uint64_t responses_matched;
+    uint64_t errors_matched;
+    uint64_t unmatched_replies;
+    uint64_t retries_sent;
+    uint64_t request_timeouts;
+    uint64_t pending_full_count;
+    size_t pending_peak;
+} comm_message_manager_stats_t;
+
+/*
  * 消息管理器运行状态。
  *
  * tx_channel      只负责发送完整帧，manager 不拥有也不关闭该通道。
@@ -112,6 +146,7 @@ typedef struct {
     void *event_context;
     uint16_t next_sequence;
     int initialized;
+    comm_message_manager_stats_t *stats; /* 调用方持有；NULL 表示不启用统计 */
 } comm_message_manager_t;
 
 /*
@@ -132,8 +167,43 @@ comm_message_manager_result_t comm_message_manager_init(
     void *event_context);
 
 /*
+ * 与 init 相同，同时启用统计。stats_storage 必须非空且与 manager、pending、
+ * 配置、通道及其他输入/输出存储不重叠，不能被其他 manager 共用；生命周期
+ * 必须覆盖 manager 全部使用过程。初始化成功清零统计，失败不修改统计。
+ * 原 init 保持不启用统计，普通发送、接收和超时接口会自动记录已启用的统计。
+ */
+comm_message_manager_result_t comm_message_manager_init_with_stats(
+    comm_message_manager_t *manager,
+    const comm_frame_channel_t *tx_channel,
+    comm_message_pending_t *pending_storage,
+    size_t pending_capacity,
+    const comm_message_manager_config_t *config,
+    comm_message_event_fn event_callback,
+    void *event_context,
+    comm_message_manager_stats_t *stats_storage);
+
+/*
+ * 复制统计快照。output 必须独立，不得与统计存储或 manager 等内部存储重叠。
+ * 未启用统计或 manager/pending 状态无效时返回 INVALID_STATE；失败不修改输出。
+ * 不加锁，只能由 manager 所属任务串行调用，也不能在回调中重入 manager。
+ * 其他任务需要统计时，由所属任务调用本接口，再通过队列传递快照。
+ */
+comm_message_manager_result_t comm_message_manager_get_stats(
+    const comm_message_manager_t *manager,
+    comm_message_manager_stats_t *output);
+
+/*
+ * 清零累计计数，pending_peak 从当前活动请求数开始。不改变 pending、sequence、
+ * 截止时间、重试次数或发送通道，不产生回调。状态与线程约束同 get_stats。
+ * 已有事务之后产生的回复、重试或超时计入新周期，不能据此倒推出历史请求数。
+ */
+comm_message_manager_result_t comm_message_manager_reset_stats(
+    comm_message_manager_t *manager);
+
+/*
  * 清除所有 pending 请求并把下一个请求序号恢复为 1。
  * 不关闭或重置发送通道，也不会为被清除的请求产生超时回调。
+ * 已启用的统计及其历史峰值保留；被清除的请求不计为回复或最终超时。
  */
 comm_message_manager_result_t comm_message_manager_reset(
     comm_message_manager_t *manager);

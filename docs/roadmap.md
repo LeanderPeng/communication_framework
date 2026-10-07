@@ -49,7 +49,8 @@
 - 统计收发帧数、CRC 错误、溢出、超时及队列峰值。
 - 使用日志和测试复现问题，而不是依赖现场猜测。
 
-当前已完成：Parser、核心帧队列以及 Linux pthread 帧队列的可选诊断统计。
+当前已完成：Parser、核心帧队列、Linux pthread 帧队列及 Message Manager 的
+可选诊断统计。
 
 队列统计使用 `comm_frame_queue_stats_reset(&queue, &stats)` 开始一个周期，
 之后统一通过 `comm_frame_queue_push_with_stats` / `comm_frame_queue_pop_with_stats`
@@ -71,5 +72,24 @@ pthread 层分别记录实际入队/出队数、遇满/遇空调用数、进入�
 发生的成功或超时记入新周期，因此清零后的等待数和完成数不一定一一对应。
 清零保留已有帧和关闭状态，峰值从当前队列深度开始。
 
-下一小步：为 Message Manager 增加请求、匹配回复、未匹配回复、重试和最终
-超时等诊断统计，让字节解析、队列积压和请求事务三个层面都可以被观察。
+Message Manager 使用 `comm_message_manager_init_with_stats` 启用统计，原 init
+保持不启用统计。统计包含通道接受的总帧数、新请求数、通道投递失败数、收到
+的请求/上报、匹配 RESPONSE/ERROR、未匹配回复、成功重发、最终超时、pending
+满拒绝次数和 pending 峰值。所有累计计数饱和递增，接收与超时事件在回调前计数。
+
+`frames_sent` 包含新请求、重发及非请求帧，只说明通道接受；`requests_sent`
+只计新建事务；重发成功增加 `retries_sent`，通道拒绝只增加 `send_failures`。
+`request_timeouts` 只计用尽重试次数后结束的事务，不计队列投递超时、manager
+复位或中途清统计。重复/迟到回复归入 `unmatched_replies`，不重复计匹配成功。
+
+`comm_message_manager_get_stats` 复制快照，`comm_message_manager_reset_stats`
+清零累计值并从当前活动请求数重设峰值，不改变 pending、序号或截止时间。
+manager 普通 reset 保留历史统计。已有事务在清零后产生的回复、重试和超时
+归入新统计周期，所以新周期的完成数不一定等于新周期发出的请求数。
+
+统计接口与 manager 一样不加锁，必须由所属任务串行调用，不能在事件回调中
+重入。其他任务需要读取时，由所属任务取得独立快照再经队列交接；pthread
+队列统计的加锁读取方式不能直接套用到 Message Manager。
+
+下一小步：补字节流级集成测试，将 Codec、RingBuffer、Parser、消息管理器和
+业务模型连接起来，使用拆包、垃圾前缀、CRC 错帧及重复回复验证整条接收链路。

@@ -3,6 +3,82 @@
 #include <stddef.h>
 #include <string.h>
 
+static void comm_message_manager_increment_counter(uint64_t *counter)
+{
+    if (*counter != UINT64_MAX) {
+        *counter += 1u;
+    }
+}
+
+/* 只在状态校验通过后调用；统计关闭时无需为峰值额外扫描 pending。 */
+static size_t comm_message_manager_count_pending(
+    const comm_message_manager_t *manager)
+{
+    size_t index;
+    size_t count = 0u;
+
+    for (index = 0u; index < manager->pending_capacity; ++index) {
+        if (manager->pending_storage[index].active == 1) {
+            count += 1u;
+        }
+    }
+    return count;
+}
+
+/* 所有实际通道投递统一在此记录，避免漏掉非请求发送或重复计算重发。 */
+static comm_frame_channel_result_t comm_message_manager_push_frame(
+    comm_message_manager_t *manager,
+    const comm_frame_t *frame)
+{
+    comm_frame_channel_result_t result = comm_frame_channel_push(
+        manager->tx_channel, frame, manager->config.send_timeout_ms);
+
+    if (manager->stats != NULL) {
+        if (result == COMM_FRAME_CHANNEL_OK) {
+            comm_message_manager_increment_counter(&manager->stats->frames_sent);
+        } else {
+            comm_message_manager_increment_counter(&manager->stats->send_failures);
+        }
+    }
+    return result;
+}
+
+/* 事务状态已提交后，先记事件，再执行原来的同步回调，不改变回调次数和顺序。 */
+static void comm_message_manager_notify_event(
+    comm_message_manager_t *manager,
+    const comm_message_event_t *event)
+{
+    if (manager->stats != NULL) {
+        uint64_t *counter = NULL;
+        switch (event->type) {
+            case COMM_MESSAGE_EVENT_REQUEST_RECEIVED:
+                counter = &manager->stats->requests_received;
+                break;
+            case COMM_MESSAGE_EVENT_REPORT_RECEIVED:
+                counter = &manager->stats->reports_received;
+                break;
+            case COMM_MESSAGE_EVENT_RESPONSE_RECEIVED:
+                counter = &manager->stats->responses_matched;
+                break;
+            case COMM_MESSAGE_EVENT_ERROR_RECEIVED:
+                counter = &manager->stats->errors_matched;
+                break;
+            case COMM_MESSAGE_EVENT_UNMATCHED_REPLY:
+                counter = &manager->stats->unmatched_replies;
+                break;
+            case COMM_MESSAGE_EVENT_REQUEST_TIMEOUT:
+                counter = &manager->stats->request_timeouts;
+                break;
+            default:
+                break;
+        }
+        if (counter != NULL) {
+            comm_message_manager_increment_counter(counter);
+        }
+    }
+    manager->event_callback(manager->event_context, event);
+}
+
 /*
  * manager 只保存通道地址，不拥有通道。初始化时必须确认这个地址当前指向
  * 一组完整绑定，避免直到第一次发送时才发现回调函数缺失。
@@ -259,22 +335,20 @@ static comm_message_manager_result_t comm_message_manager_send_frame(
         memcpy(frame.payload, payload, payload_length);
     }
 
-    channel_result = comm_frame_channel_push(
-        manager->tx_channel,
-        &frame,
-        manager->config.send_timeout_ms);
+    channel_result = comm_message_manager_push_frame(manager, &frame);
 
     return comm_message_manager_map_channel_result(channel_result);
 }
 
-comm_message_manager_result_t comm_message_manager_init(
+static comm_message_manager_result_t comm_message_manager_init_internal(
     comm_message_manager_t *manager,
     const comm_frame_channel_t *tx_channel,
     comm_message_pending_t *pending_storage,
     size_t pending_capacity,
     const comm_message_manager_config_t *config,
     comm_message_event_fn event_callback,
-    void *event_context)
+    void *event_context,
+    comm_message_manager_stats_t *stats_storage)
 {
     /*
      * event_context 允许为空，因为有些回调不需要外部对象。其余指针都是完成
@@ -305,9 +379,79 @@ comm_message_manager_result_t comm_message_manager_init(
 
     comm_message_manager_clear_pending(pending_storage, pending_capacity);
 
+    if (stats_storage != NULL) {
+        comm_message_manager_stats_t empty = {0};
+        *stats_storage = empty;
+    }
+    manager->stats = stats_storage;
+
     /* 所有字段和外部存储都准备完成后，最后发布 initialized 状态。 */
     manager->initialized = 1;
 
+    return COMM_MESSAGE_MANAGER_OK;
+}
+
+comm_message_manager_result_t comm_message_manager_init(
+    comm_message_manager_t *manager,
+    const comm_frame_channel_t *tx_channel,
+    comm_message_pending_t *pending_storage,
+    size_t pending_capacity,
+    const comm_message_manager_config_t *config,
+    comm_message_event_fn event_callback,
+    void *event_context)
+{
+    return comm_message_manager_init_internal(
+        manager, tx_channel, pending_storage, pending_capacity, config,
+        event_callback, event_context, NULL);
+}
+
+comm_message_manager_result_t comm_message_manager_init_with_stats(
+    comm_message_manager_t *manager,
+    const comm_frame_channel_t *tx_channel,
+    comm_message_pending_t *pending_storage,
+    size_t pending_capacity,
+    const comm_message_manager_config_t *config,
+    comm_message_event_fn event_callback,
+    void *event_context,
+    comm_message_manager_stats_t *stats_storage)
+{
+    if (stats_storage == NULL) {
+        return COMM_MESSAGE_MANAGER_NULL_ARGUMENT;
+    }
+    return comm_message_manager_init_internal(
+        manager, tx_channel, pending_storage, pending_capacity, config,
+        event_callback, event_context, stats_storage);
+}
+
+comm_message_manager_result_t comm_message_manager_get_stats(
+    const comm_message_manager_t *manager,
+    comm_message_manager_stats_t *output)
+{
+    if ((manager == NULL) || (output == NULL)) {
+        return COMM_MESSAGE_MANAGER_NULL_ARGUMENT;
+    }
+    if (!comm_message_manager_has_valid_pending_state(manager) ||
+        (manager->stats == NULL)) {
+        return COMM_MESSAGE_MANAGER_INVALID_STATE;
+    }
+    *output = *manager->stats;
+    return COMM_MESSAGE_MANAGER_OK;
+}
+
+comm_message_manager_result_t comm_message_manager_reset_stats(
+    comm_message_manager_t *manager)
+{
+    comm_message_manager_stats_t empty = {0};
+
+    if (manager == NULL) {
+        return COMM_MESSAGE_MANAGER_NULL_ARGUMENT;
+    }
+    if (!comm_message_manager_has_valid_pending_state(manager) ||
+        (manager->stats == NULL)) {
+        return COMM_MESSAGE_MANAGER_INVALID_STATE;
+    }
+    empty.pending_peak = comm_message_manager_count_pending(manager);
+    *manager->stats = empty;
     return COMM_MESSAGE_MANAGER_OK;
 }
 
@@ -373,6 +517,9 @@ comm_message_manager_result_t comm_message_manager_send_request(
 
     pending = comm_message_manager_find_free_pending(manager);
     if (pending == NULL) {
+        if (manager->stats != NULL) {
+            comm_message_manager_increment_counter(&manager->stats->pending_full_count);
+        }
         return COMM_MESSAGE_MANAGER_PENDING_FULL;
     }
 
@@ -402,10 +549,7 @@ comm_message_manager_result_t comm_message_manager_send_request(
         memcpy(frame.payload, payload, payload_length);
     }
 
-    channel_result = comm_frame_channel_push(
-        manager->tx_channel,
-        &frame,
-        manager->config.send_timeout_ms);
+    channel_result = comm_message_manager_push_frame(manager, &frame);
     if (channel_result != COMM_FRAME_CHANNEL_OK) {
         return comm_message_manager_map_channel_result(channel_result);
     }
@@ -423,6 +567,14 @@ comm_message_manager_result_t comm_message_manager_send_request(
 
     manager->next_sequence = comm_message_manager_next_sequence(candidate);
     *sequence = candidate;
+
+    if (manager->stats != NULL) {
+        size_t active_count = comm_message_manager_count_pending(manager);
+        comm_message_manager_increment_counter(&manager->stats->requests_sent);
+        if (active_count > manager->stats->pending_peak) {
+            manager->stats->pending_peak = active_count;
+        }
+    }
 
     return COMM_MESSAGE_MANAGER_OK;
 }
@@ -526,7 +678,7 @@ comm_message_manager_result_t comm_message_manager_handle_frame(
             return COMM_MESSAGE_MANAGER_UNSUPPORTED_FRAME_TYPE;
     }
 
-    manager->event_callback(manager->event_context, &event);
+    comm_message_manager_notify_event(manager, &event);
     return COMM_MESSAGE_MANAGER_OK;
 }
 
@@ -577,7 +729,7 @@ comm_message_manager_result_t comm_message_manager_process_timeouts(
              * REQUEST_TIMEOUT 时，对应 sequence 已经不再占用 pending 槽位。
              */
             pending->active = 0;
-            manager->event_callback(manager->event_context, &event);
+            comm_message_manager_notify_event(manager, &event);
             continue;
         }
 
@@ -586,10 +738,7 @@ comm_message_manager_result_t comm_message_manager_process_timeouts(
          * 回复较慢；保持 sequence 不变，迟到回复和本次重发的回复都能结束同一
          * 个 pending 请求事务。
          */
-        channel_result = comm_frame_channel_push(
-            manager->tx_channel,
-            &pending->request,
-            manager->config.send_timeout_ms);
+        channel_result = comm_message_manager_push_frame(manager, &pending->request);
         retry_result = comm_message_manager_map_channel_result(channel_result);
 
         if (retry_result != COMM_MESSAGE_MANAGER_OK) {
@@ -611,6 +760,9 @@ comm_message_manager_result_t comm_message_manager_process_timeouts(
         pending->deadline_ms = comm_message_manager_make_deadline(
             now_ms,
             manager->config.response_timeout_ms);
+        if (manager->stats != NULL) {
+            comm_message_manager_increment_counter(&manager->stats->retries_sent);
+        }
     }
 
     return overall_result;
