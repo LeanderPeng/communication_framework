@@ -1,0 +1,111 @@
+# Linux 多任务通讯示例
+
+这个示例让已有模块在真实 pthread 线程中运行，完成一次状态查询及业务模型
+更新。两端通过 `socketpair(AF_UNIX, SOCK_STREAM)` 交换字节，不需要串口设备、
+端口配置或额外依赖。它模拟的是沿用当前示例协议的设备，不代表实际电源板。
+
+## 编译和运行
+
+在仓库根目录执行，需要 Linux、C99 编译器、make 和 pthread：
+
+```sh
+make -C examples/linux_runtime
+./build/linux_runtime
+./build/linux_runtime retry
+./build/linux_runtime rx-full
+```
+
+`main.c` 是独立入口，不要和 `tests/test_*.c` 的入口一起链接。二进制存放在
+忽略目录 `build/`，可通过 make 的 `CC`、`CFLAGS`、`LDFLAGS` 和 `TARGET` 调整
+编译器、检查参数或输出位置。
+
+| 参数 | 演示行为 | 正常完成时的退出码 |
+| --- | --- | --- |
+| `normal`（默认） | 查询一次，收到响应，模型进度更新到 40 | 0 |
+| `retry` | 对端不回复第一次查询；200 ms 后同一序号重发并得到响应 | 0 |
+| `timeout` | 对端始终不回复；重试一次后最终超时，模型不更新 | 0 |
+| `rx-full` | 暂停消费 RX，确认队列满后恢复；16 条上报和响应依次更新模型 | 0 |
+| `stop-full` | 确认接收线程因队列满等待后，直接停止并回收 | 0 |
+| `disconnect` | 对端收到查询后断开连接，本端检测 EOF 并退出 | 1（预期） |
+| `idle` | 不发查询，空闲约 200 ms 后停止，用于观察空队列与 socket 等待唤醒 | 0 |
+
+运行中按 Ctrl+C 或发送 SIGTERM，也会执行停止和回收；退出码分别为 130 和
+143。未知参数返回 2。除这些明确的演示结果外，初始化、线程启动、收发或业务
+处理失败返回 1。示例设置了 5 秒整体运行期限，避免异常时无限运行。
+
+例如 `retry` 的关键输出如下；跨线程日志先后可能随调度变化：
+
+```text
+peer: query seq=1, received=1
+peer: intentionally withholding reply
+peer: query seq=1, received=2
+manager: event=response, seq=1, retries=1
+model: progress=40, remaining=30, door=1
+summary: mode=retry responses=1 reports=0 notifications=1 timeouts=0 retries=1 rx_wait_timeouts=0
+runtime: all workers joined; resources released
+```
+
+`model` 日志才说明业务数据已被接受；发送成功或应答匹配本身不等于业务成功。
+这里用日志替代 UI 通知，未接入 LVGL。
+
+## 线程和对象归属
+
+```text
+主线程：Appliance Client / Message Manager / Appliance Manager
+   │ TX 完整帧队列（容量 2）                  ↑ RX 完整帧队列（容量 2）
+   ↓                                        │
+发送线程：Codec → send                 接收线程：recv → RingBuffer → Parser
+                 │                                  ↑
+                 └──── 本地 socket，连接模拟设备 ────┘
+                              ↕
+模拟设备线程：独立 RingBuffer / Parser → 识别查询 → 编码响应或上报
+```
+
+- 主线程是 manager 的唯一所属任务，负责发起查询、处理 RX 帧、检查超时以及
+  更新业务模型。回调在主线程内同步执行，不从回调中重入同一个 manager。
+- 发送线程只从 TX 队列取完整帧、编码、发送。接收线程只维护自己的字节缓冲、
+  解析并向 RX 投递完整帧；两者都不直接访问 pending 或业务模型。
+- 模拟设备通过线路字节获取请求与序号，不能直接读取本端 manager 的状态。
+- 队列复制完整帧并在内部加锁；停止标志由独立 mutex 保护。每个接收端独占
+  自己的 RingBuffer，不需要给 RingBuffer 加锁。
+- 实际 UI 接入时，通知回调应复制模型并投递到 UI 任务，不能在通讯任务中
+  直接操作 LVGL。未来其他任务的查询命令也应先交给 manager 所属任务执行。
+
+## 时间、容量和异常策略
+
+超时使用 `CLOCK_MONOTONIC` 毫秒时间，不受系统日期校准影响。主线程每轮最多
+处理一帧，再检查超时；没有收到数据时最多等待 RX 队列 10 ms，避免持续上报
+饿死超时检查。200 ms 是演示用响应期限，实际触发仍受线程调度和回调耗时影响。
+
+TX 投递使用零等待：初次请求投递失败就报告失败，不登记 pending；重发因
+队列满失败时保留到期事务，下轮再尝试，不占用重试次数。不能让 manager 在
+发送队列上永久等待，否则会同时阻塞接收分发和定时检查。
+
+RX 队列满时，每次最多等待 20 ms，然后继续投递**同一帧**，不丢弃、不覆盖，
+也不继续读取新字节。socket 内核缓冲耗尽后发送方也会等待，从而形成背压。
+日志中的 `rx_wait_timeouts` 表示等待空位超时次数，不表示丢帧数。这种策略
+依赖流式 socket 的背压；未来使用无流控 UART 时必须单独设计溢出处理。
+
+每次先解析已有字节，再按 RingBuffer 剩余容量读取；完整帧与半帧都不会被
+新输入覆盖。示例故意每次最多发送 3 字节、读取 7 字节，解析不能依赖读写调用
+的边界。发送处理短写，收发遇到 `EINTR` 重试，使用 `MSG_NOSIGNAL` 避免断连
+时被 SIGPIPE 直接终止。
+
+socket EOF、其他 I/O 错误或内部错误会停止整个示例。若发送只完成了半帧后
+出错，也结束当前连接，不在同一字节流上盲目重新发送整帧。自动重连、连接
+恢复后的状态同步、真实 UART 驱动和 RTOS 适配尚未实现。
+
+## 停止与资源回收
+
+1. 设置受锁保护的停止标志；后续停止请求幂等。
+2. 关闭两个帧队列，唤醒等待出队或入队的线程。
+3. 对 socket 执行 `shutdown`，唤醒阻塞的 `recv` 和 `send`。
+4. 主线程 `join` 所有成功启动的工作线程。
+5. 最后 `close` 描述符并销毁队列、mutex。
+
+停止采用中止语义，允许放弃队列中的帧、半帧和未完成事务，不保证发送排空，
+也不会把取消的 pending 伪装成最终超时事件。队列本身虽然允许关闭后排空，
+本示例的线程会优先响应停止。
+
+线程创建中途失败时，只 join 已启动的线程。初始化中途失败时，只释放已成功
+初始化的资源。信号处理器仅记录退出请求，主线程负责执行上述回收流程。

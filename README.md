@@ -70,3 +70,17 @@ gcc -std=c99 -Wall -Wextra -Werror -pedantic \
 Message Manager 和业务模型通知，覆盖拆包、粘包、错误恢复、重复回复及超时重试。
 使用真实 pthread 队列，但在单线程内按确定顺序推进，并显式传入模拟时间。
 测试没有接入实际串口、网络或 LVGL，不能替代任务并发测试和电源板联调。
+
+## 运行 Linux 多任务示例
+
+```sh
+make -C examples/linux_runtime
+./build/linux_runtime
+./build/linux_runtime retry
+./build/linux_runtime rx-full
+```
+
+主线程串行管理请求和业务模型，收发线程通过 pthread 帧队列交接数据，模拟
+设备通过本地流式 socket 返回响应。示例使用单调时钟驱动重试，并处理队列满、
+断连和线程停止回收。更多场景、线程职责及移植边界见
+[Linux 运行示例说明](examples/linux_runtime/README.md)。
