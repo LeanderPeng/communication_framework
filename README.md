@@ -51,3 +51,22 @@ communication_framework/
 每次只完成一个可测试的小模块：先理解职责和边界，再实现代码，最后用正常与异常用例验证。不要在前一个模块未验证时继续叠加功能。
 
 详细顺序见 [docs/roadmap.md](docs/roadmap.md)。
+
+## 运行字节流级集成测试
+
+在 Linux 仓库根目录执行：
+
+```sh
+mkdir -p build
+gcc -std=c99 -Wall -Wextra -Werror -pedantic \
+    -Iinclude -Iexamples/appliance_manager -Iports/linux \
+    src/*.c examples/appliance_manager/*.c ports/linux/*.c \
+    tests/test_appliance_stream_integration.c -pthread \
+    -o build/test_appliance_stream_integration
+./build/test_appliance_stream_integration
+```
+
+该测试串联状态查询、TX 队列、编码器、模拟对端、RingBuffer、Parser、RX 队列、
+Message Manager 和业务模型通知，覆盖拆包、粘包、错误恢复、重复回复及超时重试。
+使用真实 pthread 队列，但在单线程内按确定顺序推进，并显式传入模拟时间。
+测试没有接入实际串口、网络或 LVGL，不能替代任务并发测试和电源板联调。
