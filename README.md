@@ -78,9 +78,13 @@ make -C examples/linux_runtime
 ./build/linux_runtime
 ./build/linux_runtime retry
 ./build/linux_runtime rx-full
+./build/linux_runtime stream
+./build/linux_runtime reconnect
 ```
 
 主线程串行管理请求和业务模型，收发线程通过 pthread 帧队列交接数据，模拟
 设备通过本地流式 socket 返回响应。示例使用单调时钟驱动重试，并处理队列满、
-断连和线程停止回收。更多场景、线程职责及移植边界见
+断连和线程停止回收。持续流量模式验证上报期间的超时处理；重连模式先回收旧
+连接、取消旧请求，再查询设备状态，收到有效响应后恢复在线。更多场景、线程
+职责及移植边界见
 [Linux 运行示例说明](examples/linux_runtime/README.md)。

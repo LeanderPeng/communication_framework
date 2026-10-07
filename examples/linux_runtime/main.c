@@ -23,11 +23,25 @@
 #define MANAGER_TICK_MS 10u
 #define RX_WAIT_MS 20u
 #define RUN_LIMIT_MS 5000u
+#define STREAM_DURATION_MS 1000u
+#define MAX_RECONNECTS 2u
 
 typedef enum {
     MODE_NORMAL, MODE_RETRY, MODE_TIMEOUT, MODE_RX_FULL,
-    MODE_STOP_FULL, MODE_DISCONNECT, MODE_IDLE
+    MODE_STOP_FULL, MODE_DISCONNECT, MODE_IDLE, MODE_STREAM,
+    MODE_RECONNECT, MODE_RECONNECT_TIMEOUT, MODE_RECONNECT_EXHAUSTED
 } demo_mode_t;
+
+typedef enum { CONNECTION_OFFLINE, CONNECTION_SYNCING, CONNECTION_ONLINE } connection_state_t;
+typedef enum { FAILURE_NONE, FAILURE_INTERNAL, FAILURE_TRANSPORT } failure_kind_t;
+
+/* 跨连接保存业务快照；state 表明快照是否已经在当前连接上重新确认。 */
+typedef struct {
+    appliance_manager_t appliance;
+    connection_state_t state;
+    unsigned int notifications;
+    int quiet;
+} application_t;
 
 typedef struct {
     comm_ringbuffer_t ring;
@@ -38,6 +52,8 @@ typedef struct {
 typedef struct {
     /* 初始化后到所有线程 join 前，通道绑定、描述符和模式保持不变。 */
     demo_mode_t mode;
+    unsigned int session;
+    application_t *app;
     int sockets[2];
     comm_frame_queue_pthread_t tx_queue;
     comm_frame_queue_pthread_t rx_queue;
@@ -52,6 +68,7 @@ typedef struct {
     pthread_mutex_t stop_mutex;
     int stopping;
     int failed;
+    failure_kind_t failure_kind;
     int mutex_ready;
     int tx_ready;
     int rx_ready;
@@ -60,11 +77,16 @@ typedef struct {
     comm_message_manager_t messages;
     comm_message_pending_t pending[4];
     comm_message_manager_stats_t message_stats;
-    appliance_manager_t appliance;
-    unsigned int notifications;
+    unsigned int notification_base;
     unsigned int responses;
     unsigned int reports;
     unsigned int timeouts;
+    unsigned int unmatched;
+    unsigned int ignored_reports;
+    uint16_t sync_sequence;
+    uint16_t followup_sequence;
+    /* 仅模拟设备线程写，主线程必须 join 后才能读取。 */
+    unsigned int peer_sent_reports;
     int business_failed;
 } runtime_t;
 
@@ -99,11 +121,12 @@ static int is_stopping(runtime_t *r)
  * 必须等所有线程 join 后才能 close/destroy，避免描述符复用和释放后访问。
  * 这是中止式停止，不承诺发送完队列内的帧，也不将未完成请求计为最终超时。
  */
-static void stop_runtime(runtime_t *r, const char *reason)
+static void stop_with_kind(runtime_t *r, const char *reason, failure_kind_t kind)
 {
     check_pthread(pthread_mutex_lock(&r->stop_mutex), "stop lock");
     if (!r->stopping) {
         r->stopping = 1;
+        r->failure_kind = kind;
         if (reason != NULL) {
             r->failed = 1;
             fprintf(stderr, "runtime stopped: %s\n", reason);
@@ -124,6 +147,31 @@ static void stop_runtime(runtime_t *r, const char *reason)
         }
     }
     check_pthread(pthread_mutex_unlock(&r->stop_mutex), "stop unlock");
+}
+
+static void stop_runtime(runtime_t *r, const char *reason)
+{
+    stop_with_kind(r, reason, reason == NULL ? FAILURE_NONE : FAILURE_INTERNAL);
+}
+
+static void transport_failed(runtime_t *r, const char *reason)
+{
+    stop_with_kind(r, reason, FAILURE_TRANSPORT);
+}
+
+static int reconnect_mode(demo_mode_t mode)
+{
+    return mode == MODE_RECONNECT || mode == MODE_RECONNECT_TIMEOUT ||
+           mode == MODE_RECONNECT_EXHAUSTED;
+}
+
+/* 连接状态和模型一样，只允许主线程读写；状态变化需要单独通知未来的 UI。 */
+static void set_connection_state(application_t *app, connection_state_t state,
+                                  unsigned int session)
+{
+    static const char *const names[] = {"offline", "syncing", "online"};
+    app->state = state;
+    printf("connection: session=%u state=%s\n", session, names[state]);
 }
 
 static int monotonic_ms(runtime_t *r, uint64_t *output)
@@ -178,7 +226,7 @@ static int receive_frame(runtime_t *r, int fd, stream_reader_t *reader,
             continue;
         }
         if (count <= 0) {
-            stop_runtime(r, count == 0 ? "transport EOF" : "transport recv failed");
+            transport_failed(r, count == 0 ? "transport EOF" : "transport recv failed");
             return 0;
         }
         if (comm_ringbuffer_write(&reader->ring, input, (size_t)count) != COMM_RINGBUFFER_OK) {
@@ -190,15 +238,9 @@ static int receive_frame(runtime_t *r, int fd, stream_reader_t *reader,
 }
 
 /* 短写只推进实际成功的字节数；断连返回错误，不让 SIGPIPE 终止进程。 */
-static int send_frame(runtime_t *r, int fd, const comm_frame_t *frame)
+static int send_bytes(runtime_t *r, int fd, const uint8_t *wire, size_t size)
 {
-    uint8_t wire[COMM_FRAME_MAX_ENCODED_SIZE];
-    size_t size;
     size_t offset = 0u;
-    if (comm_codec_encode(frame, wire, sizeof(wire), &size) != COMM_CODEC_OK) {
-        stop_runtime(r, "encode failed");
-        return 0;
-    }
     while (offset < size && !is_stopping(r)) {
         size_t chunk = size - offset;
         ssize_t count;
@@ -211,12 +253,23 @@ static int send_frame(runtime_t *r, int fd, const comm_frame_t *frame)
             continue;
         }
         if (count <= 0) {
-            stop_runtime(r, "transport send failed");
+            transport_failed(r, "transport send failed");
             return 0;
         }
         offset += (size_t)count;
     }
     return offset == size;
+}
+
+static int send_frame(runtime_t *r, int fd, const comm_frame_t *frame)
+{
+    uint8_t wire[COMM_FRAME_MAX_ENCODED_SIZE];
+    size_t size;
+    if (comm_codec_encode(frame, wire, sizeof(wire), &size) != COMM_CODEC_OK) {
+        stop_runtime(r, "encode failed");
+        return 0;
+    }
+    return send_bytes(r, fd, wire, size);
 }
 
 static void *tx_main(void *context)
@@ -276,7 +329,7 @@ static void *rx_main(void *context)
 }
 
 /* 模拟设备按协议字段构造业务快照，不访问本端 manager 或模型。 */
-static int peer_status(runtime_t *r, uint8_t type, uint16_t sequence, uint8_t progress)
+static comm_frame_t status_frame(uint8_t type, uint16_t sequence, uint8_t progress)
 {
     comm_frame_t frame = {0};
     frame.version = COMM_FRAME_VERSION;
@@ -289,7 +342,52 @@ static int peer_status(runtime_t *r, uint8_t type, uint16_t sequence, uint8_t pr
     frame.payload[APPLIANCE_STATUS_PROGRESS_OFFSET] = progress;
     frame.payload[APPLIANCE_STATUS_REMAINING_MINUTES_OFFSET + 1u] = 30u;
     frame.payload[APPLIANCE_STATUS_DOOR_LOCKED_OFFSET] = 1u;
+    return frame;
+}
+
+static int peer_status(runtime_t *r, uint8_t type, uint16_t sequence, uint8_t progress)
+{
+    comm_frame_t frame = status_frame(type, sequence, progress);
     return send_frame(r, r->sockets[1], &frame);
+}
+
+/* 故意只发送半个响应后结束写端，接收方必须丢弃残帧并取消对应事务。 */
+static void peer_cut_response(runtime_t *r, uint16_t sequence)
+{
+    comm_frame_t frame = status_frame(COMM_FRAME_TYPE_RESPONSE, sequence, 99u);
+    uint8_t wire[COMM_FRAME_MAX_ENCODED_SIZE];
+    size_t size;
+    if (comm_codec_encode(&frame, wire, sizeof(wire), &size) != COMM_CODEC_OK) {
+        stop_runtime(r, "peer encode failed");
+        return;
+    }
+    if (send_bytes(r, r->sockets[1], wire, size / 2u)) {
+        puts("peer: disconnecting in the middle of a response");
+        if (shutdown(r->sockets[1], SHUT_WR) != 0) {
+            stop_runtime(r, "peer shutdown failed");
+        }
+    }
+}
+
+/* 持续上报期间不回复第二次查询，末尾发送迟到回复作为流结束标记。 */
+static int peer_stream(runtime_t *r, uint16_t sequence)
+{
+    uint64_t start;
+    uint64_t now;
+    if (!monotonic_ms(r, &start)) {
+        return 0;
+    }
+    do {
+        uint8_t progress = (uint8_t)((r->peer_sent_reports + 1u) % 101u);
+        if (!peer_status(r, COMM_FRAME_TYPE_REPORT, 0u, progress)) {
+            return 0;
+        }
+        ++r->peer_sent_reports;
+        if (!monotonic_ms(r, &now)) {
+            return 0;
+        }
+    } while (now - start < STREAM_DURATION_MS && !is_stopping(r));
+    return peer_status(r, COMM_FRAME_TYPE_RESPONSE, sequence, 99u);
 }
 
 static void *peer_main(void *context)
@@ -321,6 +419,33 @@ static void *peer_main(void *context)
             puts("peer: intentionally withholding reply");
             continue;
         }
+        if (r->mode == MODE_RECONNECT_EXHAUSTED ||
+            (reconnect_mode(r->mode) && r->session == 1u && requests == 2u)) {
+            peer_cut_response(r, frame.sequence);
+            return NULL;
+        }
+        if (reconnect_mode(r->mode) && r->session > 1u) {
+            if (requests == 1u) {
+                /* 同步前的上报不能使旧缓存变为在线，未知旧序号也不能更新模型。 */
+                if (!peer_status(r, COMM_FRAME_TYPE_REPORT, 0u, 99u) ||
+                    !peer_status(r, COMM_FRAME_TYPE_RESPONSE, 2u, 99u)) {
+                    return NULL;
+                }
+            }
+            if (r->mode == MODE_RECONNECT_TIMEOUT) {
+                continue;
+            }
+            if (!peer_status(r, COMM_FRAME_TYPE_RESPONSE, frame.sequence, 80u)) {
+                return NULL;
+            }
+            continue;
+        }
+        if (r->mode == MODE_STREAM && frame.sequence != 1u) {
+            if (requests == 2u && !peer_stream(r, frame.sequence)) {
+                return NULL;
+            }
+            continue;
+        }
         if ((r->mode == MODE_RX_FULL || r->mode == MODE_STOP_FULL) && requests == 1u) {
             for (i = 1u; i <= REPORT_BURST; ++i) {
                 if (!peer_status(r, COMM_FRAME_TYPE_REPORT, 0u, (uint8_t)i)) {
@@ -337,8 +462,11 @@ static void *peer_main(void *context)
 
 static void model_changed(void *context, const appliance_model_t *model)
 {
-    runtime_t *r = context;
-    ++r->notifications;
+    application_t *app = context;
+    ++app->notifications;
+    if (app->quiet && app->notifications != 1u && app->notifications % 1000u != 0u) {
+        return;
+    }
     /* 此处只打印；未来接入 UI 时必须复制快照并交给 UI 任务。 */
     printf("model: progress=%u, remaining=%u, door=%d\n",
            (unsigned int)model->progress_percent,
@@ -361,29 +489,46 @@ static const char *event_name(comm_message_event_type_t type)
 static void message_event(void *context, const comm_message_event_t *event)
 {
     runtime_t *r = context;
-    printf("manager: event=%s, seq=%u, retries=%u\n", event_name(event->type),
-           (unsigned int)event->frame.sequence, (unsigned int)event->retries_done);
+    if (r->mode != MODE_STREAM || event->type != COMM_MESSAGE_EVENT_REPORT_RECEIVED) {
+        printf("manager: event=%s, seq=%u, retries=%u\n", event_name(event->type),
+               (unsigned int)event->frame.sequence, (unsigned int)event->retries_done);
+    }
     if (event->type == COMM_MESSAGE_EVENT_REQUEST_TIMEOUT) {
         ++r->timeouts;
+    } else if (event->type == COMM_MESSAGE_EVENT_ERROR_RECEIVED) {
+        /* ERROR 已结束对应事务，不能继续等一个永远不会触发的 pending 超时。 */
+        r->business_failed = 1;
+    } else if (event->type == COMM_MESSAGE_EVENT_UNMATCHED_REPLY) {
+        ++r->unmatched;
     } else if (event->type == COMM_MESSAGE_EVENT_RESPONSE_RECEIVED ||
                event->type == COMM_MESSAGE_EVENT_REPORT_RECEIVED) {
         if (event->type == COMM_MESSAGE_EVENT_RESPONSE_RECEIVED) {
             ++r->responses;
         } else {
             ++r->reports;
+            if (r->app->state != CONNECTION_ONLINE) {
+                ++r->ignored_reports;
+                return;
+            }
         }
-        if (appliance_manager_handle_message_event(&r->appliance, event) != APPLIANCE_MANAGER_OK) {
+        if (appliance_manager_handle_message_event(&r->app->appliance, event) != APPLIANCE_MANAGER_OK) {
             r->business_failed = 1;
+        } else if (event->type == COMM_MESSAGE_EVENT_RESPONSE_RECEIVED &&
+                   event->frame.sequence == r->sync_sequence && r->app->state == CONNECTION_SYNCING) {
+            set_connection_state(r->app, CONNECTION_ONLINE, r->session);
         }
     }
 }
 
 /* 部分初始化失败也统一走 destroy；尚未启动线程，无需 shutdown 或 join。 */
-static int init_runtime(runtime_t *r, demo_mode_t mode)
+static int init_runtime(runtime_t *r, demo_mode_t mode, application_t *app, unsigned int session)
 {
     const comm_message_manager_config_t config = {200u, 0u, 1u};
     memset(r, 0, sizeof(*r));
     r->mode = mode;
+    r->app = app;
+    r->session = session;
+    r->notification_base = app->notifications;
     r->sockets[0] = -1;
     r->sockets[1] = -1;
     if (pthread_mutex_init(&r->stop_mutex, NULL) != 0) {
@@ -403,7 +548,6 @@ static int init_runtime(runtime_t *r, demo_mode_t mode)
     if (comm_frame_channel_pthread_bind(&r->tx, &r->tx_queue) != COMM_FRAME_CHANNEL_OK ||
         comm_frame_channel_pthread_bind(&r->rx, &r->rx_queue) != COMM_FRAME_CHANNEL_OK ||
         socketpair(AF_UNIX, SOCK_STREAM, 0, r->sockets) != 0 ||
-        appliance_manager_init(&r->appliance, model_changed, r) != APPLIANCE_MANAGER_OK ||
         comm_message_manager_init_with_stats(&r->messages, &r->tx, r->pending, 4u,
             &config, message_event, r, &r->message_stats) != COMM_MESSAGE_MANAGER_OK) {
         return 0;
@@ -472,12 +616,11 @@ static void run_manager(runtime_t *r)
 {
     uint64_t start;
     uint64_t now;
-    uint16_t sequence;
     int hold_rx = r->mode == MODE_RX_FULL || r->mode == MODE_STOP_FULL;
     if (!monotonic_ms(r, &start)) {
         return;
     }
-    if (r->mode != MODE_IDLE && appliance_client_request_status(&r->messages, start, &sequence)
+    if (r->mode != MODE_IDLE && appliance_client_request_status(&r->messages, start, &r->sync_sequence)
         != COMM_MESSAGE_MANAGER_OK) {
         stop_runtime(r, "initial query rejected by TX channel");
         return;
@@ -523,6 +666,9 @@ static void run_manager(runtime_t *r)
                 break;
             }
             if (received == COMM_FRAME_CHANNEL_OK) {
+                if (is_stopping(r)) {
+                    break;
+                }
                 if (comm_message_manager_handle_frame(&r->messages, &frame) != COMM_MESSAGE_MANAGER_OK) {
                     stop_runtime(r, "handle frame failed");
                     return;
@@ -541,9 +687,32 @@ static void run_manager(runtime_t *r)
             stop_runtime(r, "process timeouts failed");
             return;
         }
-        if (r->business_failed || (r->timeouts != 0u && r->mode != MODE_TIMEOUT)) {
-            stop_runtime(r, "unexpected business result or timeout");
+        if (r->business_failed) {
+            stop_runtime(r, "business reply rejected");
             return;
+        }
+        if (r->timeouts != 0u && r->mode != MODE_TIMEOUT && r->mode != MODE_STREAM) {
+            stop_runtime(r, r->app->state == CONNECTION_SYNCING ?
+                         "state synchronization timed out" : "query timed out");
+            return;
+        }
+        if (r->mode == MODE_STREAM ||
+            (reconnect_mode(r->mode) && r->session == 1u)) {
+            if (r->app->state == CONNECTION_ONLINE && r->followup_sequence == 0u) {
+                result = appliance_client_request_status(&r->messages, now, &r->followup_sequence);
+                if (result != COMM_MESSAGE_MANAGER_OK && result != COMM_MESSAGE_MANAGER_CHANNEL_TIMEOUT) {
+                    stop_runtime(r, "followup query failed");
+                    return;
+                }
+            }
+            if (r->mode == MODE_STREAM && r->unmatched != 0u) {
+                if (r->timeouts != 1u || r->reports == 0u) {
+                    stop_runtime(r, "stream did not exercise timeout handling");
+                    return;
+                }
+                break;
+            }
+            continue;
         }
         if ((r->mode == MODE_TIMEOUT && r->timeouts == 1u) ||
             (r->mode != MODE_TIMEOUT && r->responses == 1u &&
@@ -554,14 +723,112 @@ static void run_manager(runtime_t *r)
     stop_runtime(r, NULL);
 }
 
+/* manager 由主线程拥有；join 后清除旧事务，不把断线取消冒充请求最终超时。 */
+static unsigned int cancel_pending(runtime_t *r)
+{
+    size_t i;
+    unsigned int cancelled = 0u;
+    for (i = 0u; i < r->messages.pending_capacity; ++i) {
+        if (r->pending[i].active) {
+            ++cancelled;
+        }
+    }
+    if (comm_message_manager_reset(&r->messages) != COMM_MESSAGE_MANAGER_OK) {
+        fprintf(stderr, "manager reset failed\n");
+        abort();
+    }
+    return cancelled;
+}
+
+/* 不再访问已销毁的运行对象；分段等待允许信号中断重连退避。 */
+static int reconnect_delay(unsigned int attempt)
+{
+    unsigned int i;
+    for (i = 0u; i < attempt * 10u && !interrupted; ++i) {
+        const struct timespec delay = {0, 10000000L};
+        if (nanosleep(&delay, NULL) != 0 && errno != EINTR) {
+            perror("reconnect delay");
+            return 0;
+        }
+    }
+    return !interrupted;
+}
+
+/* 新连接建立前彻底回收旧连接，旧队列、线程和半帧不能跨连接复用。 */
+static int run_sessions(demo_mode_t mode, const char *name, application_t *app)
+{
+    unsigned int session;
+    for (session = 1u; ; ++session) {
+        runtime_t runtime;
+        comm_message_manager_stats_t messages;
+        comm_frame_queue_pthread_stats_t rx;
+        appliance_model_t model;
+        failure_kind_t failure;
+        unsigned int cancelled;
+        int status;
+        if (interrupted) {
+            return 0;
+        }
+        if (!init_runtime(&runtime, mode, app, session)) {
+            fprintf(stderr, "runtime initialization failed\n");
+            destroy_runtime(&runtime);
+            return 1;
+        }
+        set_connection_state(app, CONNECTION_SYNCING, session);
+        if (start_runtime(&runtime)) {
+            run_manager(&runtime);
+        }
+        stop_runtime(&runtime, NULL);
+        set_connection_state(app, CONNECTION_OFFLINE, session);
+        join_runtime(&runtime);
+        /* 所有旧任务已退出，才能检查原因、读取统计和销毁旧连接。 */
+        failure = runtime.failure_kind;
+        status = runtime.failed ? 1 : 0;
+        cancelled = cancel_pending(&runtime);
+        if (comm_message_manager_get_stats(&runtime.messages, &messages) != COMM_MESSAGE_MANAGER_OK ||
+            !queue_snapshot(&runtime, &rx) ||
+            appliance_manager_get_model(&app->appliance, &model) != APPLIANCE_MANAGER_OK) {
+            status = 1;
+            failure = FAILURE_INTERNAL;
+        } else {
+            printf("summary: mode=%s session=%u responses=%u reports=%u notifications=%u timeouts=%u "
+                   "retries=%" PRIu64 " rx_wait_timeouts=%" PRIu64 " unmatched=%u ignored_reports=%u "
+                   "cancelled_pending=%u cached_progress=%u peer_reports=%u\n",
+                   name, session, runtime.responses, runtime.reports,
+                   app->notifications - runtime.notification_base, runtime.timeouts,
+                   messages.retries_sent, rx.push_timeout_count, runtime.unmatched,
+                   runtime.ignored_reports, cancelled, (unsigned int)model.progress_percent,
+                   runtime.peer_sent_reports);
+            if (mode == MODE_STREAM && !interrupted && failure == FAILURE_NONE &&
+                (runtime.reports != runtime.peer_sent_reports || messages.retries_sent != 1u)) {
+                fprintf(stderr, "stream accounting mismatch\n");
+                status = 1;
+                failure = FAILURE_INTERNAL;
+            }
+        }
+        destroy_runtime(&runtime);
+        puts("runtime: all workers joined; resources released");
+        if (interrupted || !reconnect_mode(mode) || failure != FAILURE_TRANSPORT) {
+            return status;
+        }
+        if (session > MAX_RECONNECTS) {
+            fprintf(stderr, "reconnect: attempt limit reached\n");
+            return 1;
+        }
+        printf("reconnect: attempt=%u delay_ms=%u\n", session, session * 100u);
+        if (!reconnect_delay(session)) {
+            return interrupted ? 0 : 1;
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     static const char *const names[] = {
-        "normal", "retry", "timeout", "rx-full", "stop-full", "disconnect", "idle"
+        "normal", "retry", "timeout", "rx-full", "stop-full", "disconnect", "idle",
+        "stream", "reconnect", "reconnect-timeout", "reconnect-exhausted"
     };
-    runtime_t runtime;
-    comm_message_manager_stats_t messages;
-    comm_frame_queue_pthread_stats_t rx;
+    application_t app = {0};
     struct sigaction action;
     size_t mode = 0u;
     int status;
@@ -573,7 +840,8 @@ int main(int argc, char **argv)
         }
     }
     if (argc > 2 || mode == sizeof(names) / sizeof(names[0])) {
-        fprintf(stderr, "usage: %s [normal|retry|timeout|rx-full|stop-full|disconnect|idle]\n", argv[0]);
+        fprintf(stderr, "usage: %s [normal|retry|timeout|rx-full|stop-full|disconnect|idle|"
+                "stream|reconnect|reconnect-timeout|reconnect-exhausted]\n", argv[0]);
         return 2;
     }
     (void)setvbuf(stdout, NULL, _IOLBF, 0);
@@ -584,28 +852,11 @@ int main(int argc, char **argv)
         perror("sigaction");
         return 1;
     }
-    if (!init_runtime(&runtime, (demo_mode_t)mode)) {
-        fprintf(stderr, "runtime initialization failed\n");
-        destroy_runtime(&runtime);
+    app.quiet = mode == MODE_STREAM;
+    if (appliance_manager_init(&app.appliance, model_changed, &app) != APPLIANCE_MANAGER_OK) {
+        fprintf(stderr, "application initialization failed\n");
         return 1;
     }
-    if (start_runtime(&runtime)) {
-        run_manager(&runtime);
-    }
-    stop_runtime(&runtime, NULL);
-    join_runtime(&runtime);
-    /* 工作线程已退出，统计对象仍存活；manager 仍由原主线程读取。 */
-    status = runtime.failed ? 1 : 0;
-    if (comm_message_manager_get_stats(&runtime.messages, &messages) != COMM_MESSAGE_MANAGER_OK ||
-        !queue_snapshot(&runtime, &rx)) {
-        status = 1;
-    } else {
-        printf("summary: mode=%s responses=%u reports=%u notifications=%u timeouts=%u "
-               "retries=%" PRIu64 " rx_wait_timeouts=%" PRIu64 "\n",
-               names[mode], runtime.responses, runtime.reports, runtime.notifications,
-               runtime.timeouts, messages.retries_sent, rx.push_timeout_count);
-    }
-    destroy_runtime(&runtime);
-    puts("runtime: all workers joined; resources released");
+    status = run_sessions((demo_mode_t)mode, names[mode], &app);
     return interrupted ? 128 + (int)interrupted : status;
 }
